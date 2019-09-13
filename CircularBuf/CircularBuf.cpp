@@ -1,17 +1,10 @@
 #include <ctime>
-//#include <chrono>
 #include <iostream>
 #include <string>
-//#include <unistd.h>
-//#include <sys/time.h>
 #include <string.h>
-//#include <pthread.h>
-#include <Windows.h>
 #include <stdio.h>
-
-//#include "../Services/ServiceUtils.h"
-
-using namespace std;
+#include <Windows.h>
+//#include <pthread.h>
 
 // A demo instance of Camera module using circular buffer
 // 1. Test the circular buffer 
@@ -23,6 +16,7 @@ using namespace std;
 extern "C"
 {
 #include <libavformat/avformat.h>
+#include <libavutil/avutil.h>
 #include <libavutil/timestamp.h>
 #include <libavutil/time.h>
 }
@@ -31,7 +25,7 @@ class CircularBuffer
 {
 public:
 	CircularBuffer();
-	CircularBuffer(int max_pts_span, int max_size);
+	CircularBuffer(int time_span, int max_size, AVFormatContext* ifmt_Ctx);
 	~CircularBuffer();
 
 	// add a video or audio packet to the circular buffer
@@ -49,18 +43,26 @@ public:
 	// 0 return indicates no available packet is read. Or the main event reading has reached the end.
 	int read_mn_packet(AVPacket* pkt);
 
-	// reset the main event reading pointer to the first available packet
-	void reset_mn_read();
+	// reset the main event reading pointer to s seconds from the last packet
+	void reset_mn_read(int s);
+
+	// get the input format context
+	AVFormatContext* get_input_format_context();
 
 protected:
 	AVPacketList* first_pkt; // pointer to the first added packet in the circular buffer
 	AVPacketList* last_pkt; // pointer to the new added packet in the circular buffer
 	AVPacketList* bg_pkt; // the background reading pointer
 	AVPacketList* mn_pkt;// the background reading pointer
+	AVFormatContext* m_ifmt_Ctx; // The camera input format context
 
 	int m_TotalPkts; // counter of total packets in the circular buffer
 	int m_size;  // total size of the packets in the buffer
-	int64_t m_MaxPTSSpan;  // max pts span in the buffer
+	int64_t m_time_span;  // max time span in seconds
+	int64_t m_pts_offset_video; // offset of video stream pts against the epoch wall clock in miliseconds
+	int64_t m_pts_offset_audio; // offset of audio stream pts against the epoch wall clock in miliseconds
+	int m_index_video;
+	int m_index_audio;
 	int m_MaxSize;
 
 	bool flag_writing; // flag indicates adding new packet to the circular buffer
@@ -70,21 +72,39 @@ protected:
 // global variables
 CircularBuffer* cbuf; // global shared the circular buffer
 AVFormatContext* ifmt_Ctx = NULL;  // global shared input format context
-int64_t lastReadPacktTime; // global shared time stamp for call back
-string prefix_videofile = "";
+int64_t lastReadPacktTime = 0; // global shared time stamp for call back
+std::string prefix_videofile = "C:\\Users\\georges\\Documents\\CopTraxTemp\\";
+
+class VideoRecorder
+{
+public:
+	VideoRecorder();
+	~VideoRecorder();
+
+	int init(AVCodecParameters* instream_codecpar);
+	int open(std::string url);  // open a video recorder specified by url, can be a filename or a rtp url
+	int close();  // close the video recorder
+	int record(AVPacket* pkt); // save the packet to the video recorder
+	int set_options(std::string option, std::string value); // set the options for video recorder, has to be called before open
+
+protected:
+	std::string m_url;
+	AVFormatContext* m_ofmt_Ctx;
+	AVDictionary* m_options;
+};
 
 static int interrupt_cb(void* ctx)
 {
-	int  timeout = 100;
-	if (av_gettime() - lastReadPacktTime > timeout * 1000 * 1000)
+	int64_t  timeout = 100 * 1000 * 1000;
+	if (av_gettime() - lastReadPacktTime > timeout)
 	{
 		return -1;
 	}
 	return 0;
-}
+};
 
 // This is the sub thread that captures the video streams from specified IP camera and saves them into the circular buffer
-//void* videoCapture(void* myptr)
+// void* videoCapture(void* myptr)
 DWORD WINAPI videoCapture(LPVOID myPtr)
 {
 	AVPacket pkt;
@@ -108,49 +128,30 @@ DWORD WINAPI videoCapture(LPVOID myPtr)
 		fprintf(stderr, "Cannot find video stream in the camera.\n");
 		exit(1);
 	}
-	AVRational in_stream_time_base = ifmt_Ctx->streams[index_video]->time_base; //time base of video stream from the IP camera
-	int32_t factor_num = in_stream_time_base.num * 1000;  // factor to adjust the time base of camera stream to wall clock time base
-	int32_t factor_den = in_stream_time_base.den * 1; // factor to adjust the time base of camera stream to wall clock time base
 
 	// read packets from IP camera and save it into circular buffer
 	while (true)
 	{
 		ret = av_read_frame(ifmt_Ctx, &pkt); // read a frame from the camera
 		
-		// save those video stream only
+		// handle the timeout, blue screen shall be added here
 		if (ret < 0)
-			break;
+		{
+			fprintf(stderr, "Timeout when read from the IP camera.\n");
+			continue;
+		}
 
+		// save those video stream only
 		if (pkt.pts == AV_NOPTS_VALUE || pkt.stream_index != index_video)
 		{
-			// add blue screen here
 			av_packet_unref(&pkt);
 			continue;
 		}
 
-		// Store the starting point of pts and wall clock
-		int64_t wclk = av_gettime() / 1000; // current wall clock in miliseconds, epoch time
-		if (pts0 == 0)
-		{
-			pts0 = pkt.pts; // origin of pts
-			wclk0 = wclk; // origin of wall clock
-			fprintf(stderr, "Origin of the stream %lld %lld.\n", pts0, wclk0);
-		}
-
-		pkt.pts = (pkt.pts - pts0) * factor_num / factor_den + wclk0;
-		//pkt.dts = (pkt.dts - pts0) * factor_num / factor_den + wclk0;
-		pkt.dts = pkt.pts;
-		if (pkt.duration > 0)
-			pkt.duration = pkt.duration * factor_num / factor_den;
-		else
-			pkt.duration = 0;
-
-		// add the reading packet to circular buffer
-		fprintf(stderr, "%lldms: Add packet (%lld, %d). ",
-			wclk - wclk0, pkt.pts - wclk0, pkt.size);
-		ret = cbuf->add_packet(&pkt);  // add the read packet to the circular buffer
+		ret = cbuf->add_packet(&pkt);  // add the packet to the circular buffer
 		if (ret > 0)
-			fprintf(stderr, "Circular buffer has %d packets now.\n", ret);
+			fprintf(stderr, "Add a new packet (%lld, %d) into the circular buffer of %d packets now.\n", 
+				1000 * pkt.pts * ifmt_Ctx->streams[index_video]->time_base.num / ifmt_Ctx->streams[index_video]->time_base.den, pkt.size, ret);
 		else
 			fprintf(stderr, "Circular buffer is now full.\n");
 		av_packet_unref(&pkt); // handle the release of the packet here
@@ -172,10 +173,10 @@ char* av_err(int ret)
 int main(int argc, char** argv)
 {
 	// The IP camera
-	string CameraPath = "rtsp://10.25.50.20/h264";
-	//string CameraPath = "rtsp://10.0.9.113:8554/0";
-	string filename_bg = ""; // file name of background recording
-	string filename_mn = ""; // file name of main recording
+	//std::string CameraPath = "rtsp://10.25.50.20/h264";
+	std::string CameraPath = "rtsp://10.0.9.113:8554/0";
+	std::string filename_bg = ""; // file name of background recording
+	std::string filename_mn = ""; // file name of main recording
 
 	if (argc > 1)
 		CameraPath.assign(argv[1]);
@@ -186,7 +187,7 @@ int main(int argc, char** argv)
 	av_dict_set(&options, "buffer_size", "200000", 0); // 200k for 1080p
 	av_dict_set(&options, "rtsp_transport", "tcp", 0); // using tcp for rtsp
 	av_dict_set(&options, "stimeout", "100000", 0); // set timeout to be 100ms, in micro second
-	av_dict_set(&options, "max_delay", "500000", 0); // set max delay to be 500ms
+	//av_dict_set(&options, "max_delay", "500000", 0); // set max delay to be 500ms
 
 	//ifmt_Ctx->interrupt_callback.callback = interrupt_cb;
 	ret = avformat_open_input(&ifmt_Ctx, CameraPath.c_str(), 0, &options);
@@ -207,7 +208,7 @@ int main(int argc, char** argv)
 	av_dump_format(ifmt_Ctx, 0, CameraPath.c_str(), 0);
 
 	// Open a circular buffer
-	cbuf = new CircularBuffer(30 * 1000, 100 * 1000 * 1000); // 30s and 100M
+	cbuf = new CircularBuffer(30, 100 * 1000 * 1000, ifmt_Ctx); // 30s and 100M
 
 	// assign the output format. It is used for background recordings
 	AVFormatContext* ofmt_Ctx = NULL;
@@ -219,32 +220,55 @@ int main(int argc, char** argv)
 	}
 	AVOutputFormat* ofmt = ofmt_Ctx->oformat;
 
+	// find the index of video stream
+	int index_video = -1;
 	for (int i = 0; i < ifmt_Ctx->nb_streams; i++)
 	{
-		AVStream* out_stream = avformat_new_stream(ofmt_Ctx, NULL);
-		if (!out_stream)
+		if (ifmt_Ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
 		{
-			fprintf(stderr, "Failed allocating output stream.");
-			exit(1);
+			index_video = i;
+			break; // break the for loop
 		}
-
-		// copy the IP camera stream parameters to the video file stream
-		ret = avcodec_parameters_copy(out_stream->codecpar, ifmt_Ctx->streams[i]->codecpar);
-		if (ret < 0)
-		{
-			fprintf(stderr, "Failed to copy codec parameters.");
-			exit(1);
-		}
-		//out_stream->codecpar->codec_tag = 0;
-		out_stream->time_base.num = 1;
-		out_stream->time_base.den = 16000; // wall clock time base is 1/1000
+	}
+	if (index_video < 0)
+	{
+		fprintf(stderr, "Cannot find video stream in the camera.\n");
+		exit(1);
 	}
 
+	// Add a new stream to the recording file. It is required to be called before avformat_write_header()
+	AVStream* out_stream = avformat_new_stream(ofmt_Ctx, NULL);
+	if (!out_stream)
+	{
+		fprintf(stderr, "Failed allocating output stream.");
+		exit(1);
+	}
+
+	// copy the IP camera stream parameters to the video file stream
+	ret = avcodec_parameters_copy(out_stream->codecpar, ifmt_Ctx->streams[index_video]->codecpar);
+	if (ret < 0)
+	{
+		fprintf(stderr, "Failed to copy codec parameters.");
+		exit(1);
+	}
+
+	out_stream->id = ofmt_Ctx->nb_streams - 1;
+	out_stream->codecpar->codec_tag = 0;
+	//out_stream->time_base.num = 1;
+	//out_stream->time_base.den = 1000; // wall clock time base is 1/1000
+	//out_stream->avg_frame_rate.num = 30 * out_stream->time_base.den;
+	//out_stream->avg_frame_rate.den = out_stream->time_base.den;
+	//out_stream->r_frame_rate.num = 30 * out_stream->time_base.den;
+	//out_stream->r_frame_rate.den = out_stream->time_base.den;
+	//out_stream->pts_wrap_bits = 64;
+	//out_stream->internal->avctx->pkt_timebase = out_stream->time_base;
+	//avpriv_set_pts_info(out_stream, 64, 1, 1000);
+	av_dump_format(ofmt_Ctx, 0, "sample.mp4", 1);
+	
 	int64_t ChunkTime_bg = 0;  // Chunk time for background recording
 	int64_t ChunkTime_mn = 0;
 	int64_t CurrentTime;
 	int number_bg = 0;
-
 
 	// Start a seperate thread to capture video stream from the IP camera
 	//pthread_t thread;
@@ -256,10 +280,11 @@ int main(int argc, char** argv)
 		fprintf(stderr, "Cannot create the timer thread.");
 		exit(1);
 	}
-	av_usleep(5*1000*1000);
+	av_usleep(5*1000*1000); // sleep for a while to have the circular buffer accumulated
 
 	AVDictionary* dictionary = NULL;
-	av_dict_set(&dictionary, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+	//av_dict_set(&dictionary, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+	av_dict_set(&dictionary, "movflags", "frag_keyframe", 0);
 	AVPacket pkt;
 	int64_t pts0 = 0;
 
@@ -284,17 +309,14 @@ int main(int argc, char** argv)
 				fprintf(stderr, "First background recording.\n");
 
 			// Open a new chunk
-			filename_bg = prefix_videofile + to_string(number_bg++) + ".mp4";
+			filename_bg = prefix_videofile + std::to_string(number_bg++) + ".mp4";
 			av_dump_format(ofmt_Ctx, 0, filename_bg.c_str(), 1);
 
-			if (!(ofmt->flags & AVFMT_NOFILE))
+			ret = avio_open(&ofmt_Ctx->pb, filename_bg.c_str(), AVIO_FLAG_WRITE);
+			if (ret < 0)
 			{
-				ret = avio_open(&ofmt_Ctx->pb, filename_bg.c_str(), AVIO_FLAG_WRITE);
-				if (ret < 0)
-				{
-					fprintf(stderr, "Could not open output file %sn", filename_bg.c_str());
-					break;
-				}
+				fprintf(stderr, "Could not open output file %sn", filename_bg.c_str());
+				break;
 			}
 
 			ret = avformat_write_header(ofmt_Ctx, &dictionary);
@@ -307,12 +329,17 @@ int main(int argc, char** argv)
 
 		// read a background packet from the queue
 		ret = cbuf->read_bg_packet(&pkt);
-		if (ret > 0)
+		if (ret > 0 && pkt.stream_index == index_video)
 		{
 			if (pts0 == 0)
 				pts0 = pkt.pts;
+
+			pkt.pts = av_rescale_q(pkt.pts, ifmt_Ctx->streams[index_video]->time_base, ofmt_Ctx->streams[0]->time_base);
+			pkt.dts = pkt.pts;
+			if (pkt.duration > 0)
+				pkt.duration = av_rescale_q(pkt.duration, ifmt_Ctx->streams[index_video]->time_base, ofmt_Ctx->streams[0]->time_base);
 			fprintf(stderr, "Read a packet (%lld, %d), %d packets left in circular buffer.\n",
-				pkt.pts - pts0, pkt.size, ret);
+				1000 * (pkt.pts - pts0) * ofmt_Ctx->streams[0]->time_base.num / ofmt_Ctx->streams[0]->time_base.den, pkt.size, ret);
 
 			pkt.pos = -1;
 			ret = av_interleaved_write_frame(ofmt_Ctx, &pkt);
@@ -351,14 +378,19 @@ CircularBuffer::CircularBuffer()
 
 	m_TotalPkts = 0;
 	m_size = 0;
-	m_MaxPTSSpan = 0;
+	m_time_span = 0;
+	m_pts_offset_audio = 0;
+	m_pts_offset_video = 0;
 	m_MaxSize = 0;
+	m_index_audio = -1;
+	m_index_video = -1;
+	m_ifmt_Ctx = NULL;
 	
 	flag_writing = false;
 	flag_reading = false;
 }
 
-CircularBuffer::CircularBuffer(int max_pts_span, int max_size)
+CircularBuffer::CircularBuffer(int time_span, int max_size, AVFormatContext *ifmt_Ctx)
 {
 	first_pkt = NULL;
 	last_pkt = NULL;
@@ -367,14 +399,28 @@ CircularBuffer::CircularBuffer(int max_pts_span, int max_size)
 
 	m_TotalPkts = 0;
 	m_size = 0;
-	m_MaxPTSSpan = 0;
+	m_time_span = time_span;
+	m_pts_offset_audio = 0;
+	m_pts_offset_video = 0;
 	m_MaxSize = 0;
+	m_index_audio = -1;
+	m_index_video = -1;
 
 	flag_writing = false;
 	flag_reading = false;
+	m_ifmt_Ctx = ifmt_Ctx;
 
-	if (max_pts_span > 0)
-		m_MaxPTSSpan = max_pts_span;
+	for (int i = 0; i < m_ifmt_Ctx->nb_streams; i++)
+	{
+		if (m_ifmt_Ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+		{
+			m_index_video = i;
+		}
+		else if (m_ifmt_Ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+		{
+			m_index_audio = i;
+		}
+	}
 
 	if (max_size > 0)
 		m_MaxSize = max_size;
@@ -391,7 +437,7 @@ CircularBuffer::~CircularBuffer()
 	}
 }
 
-// add a video or audio packet to the circular buffer
+// add a video or audio packet to the circular buffer, pts and dts are adjust to wall clock
 // positive return indicates the packet is added successfully. The number returned is the current total packets in the circular buffer.
 // 0 return indicates that the packet is added successfully but the circular buffer has suffered oversized and been revised.
 // negative return indicates that the packet is not added due to run out of memory
@@ -423,6 +469,37 @@ int CircularBuffer::add_packet(AVPacket* pkt)
 	av_packet_ref(&pktl->pkt, pkt);  // leave the pkt alone
 	//av_packet_move_ref(&pktl->pkt, pkt);  // this makes the pkt unref
 	pktl->next = NULL;
+	int64_t allowed_pts_video = 0;
+	int64_t allowed_pts_audio = 0;
+	if (m_index_video >= 0)
+		allowed_pts_video = m_time_span * m_ifmt_Ctx->streams[m_index_video]->time_base.den / m_ifmt_Ctx->streams[m_index_video]->time_base.num;  // max video pts
+	if (m_index_audio >= 0)
+		allowed_pts_audio = m_time_span * m_ifmt_Ctx->streams[m_index_audio]->time_base.den / m_ifmt_Ctx->streams[m_index_audio]->time_base.num;  // max audio pts
+
+	// adjust the packet pts to the wall clock based
+	if (pkt->stream_index == m_index_audio)
+	{
+		if (m_pts_offset_audio ==0)
+			m_pts_offset_audio = av_gettime() / m_ifmt_Ctx->streams[m_index_audio]->time_base.num * m_ifmt_Ctx->streams[m_index_audio]->time_base.den / 1000000 - pkt->pts;
+		pktl->pkt.pts += m_pts_offset_audio;
+		pktl->pkt.dts += m_pts_offset_audio;
+		allowed_pts_audio = pktl->pkt.pts - allowed_pts_audio;
+		if (m_index_video >= 0)
+			allowed_pts_video = av_rescale_q(pktl->pkt.pts, m_ifmt_Ctx->streams[m_index_audio]->time_base, m_ifmt_Ctx->streams[m_index_video]->time_base)
+			- allowed_pts_video;
+	}
+	
+	if (pkt->stream_index == m_index_video)
+	{
+		if (m_pts_offset_video == 0)
+			m_pts_offset_video = av_gettime() / m_ifmt_Ctx->streams[m_index_video]->time_base.num * m_ifmt_Ctx->streams[m_index_video]->time_base.num / 1000000 - pkt->pts;
+		pktl->pkt.pts += m_pts_offset_video;
+		pktl->pkt.dts += m_pts_offset_video;
+		allowed_pts_video = pktl->pkt.pts - allowed_pts_video;
+		if (m_index_audio >= 0)
+			allowed_pts_audio = av_rescale_q(pktl->pkt.pts, m_ifmt_Ctx->streams[m_index_video]->time_base, m_ifmt_Ctx->streams[m_index_audio]->time_base) 
+			- allowed_pts_audio;
+	}
 
 	// modify the pointers
 	if (!last_pkt)
@@ -448,10 +525,10 @@ int CircularBuffer::add_packet(AVPacket* pkt)
 		mn_pkt = last_pkt;
 
 	// revise the circular buffer by kicking out those overflowed packets
-	int64_t allowed_pts = last_pkt->pkt.pts - m_MaxPTSSpan;
 	int64_t pts_bg = bg_pkt->pkt.pts;
 	int64_t pts_mn = mn_pkt->pkt.pts;
-	while (first_pkt->pkt.pts < allowed_pts)
+	while ((first_pkt->pkt.stream_index == m_index_audio && first_pkt->pkt.pts < allowed_pts_audio) 
+		|| (first_pkt->pkt.stream_index == m_index_video && first_pkt->pkt.pts < allowed_pts_video))
 	{
 		pktl = first_pkt;
 		m_TotalPkts--; // reduce the number of total packets
@@ -500,56 +577,196 @@ int CircularBuffer::read_bg_packet(AVPacket* pkt)
 // 0 return indicates no available packet is read. Or the main event reading has reached the end.
 int CircularBuffer::read_mn_packet(AVPacket* pkt)
 {
-	// if the buffer is empty
-	if (!last_pkt)
-	{
-		first_pkt = NULL;
-		bg_pkt = NULL;
-		mn_pkt = NULL;
+	// no reading while adding new packet
+	if (flag_writing)
 		return 0;
-	}
 
-	AVPacketList* pktl = mn_pkt;
-	if (pktl)
+	flag_reading = true;
+	int ret = 0;
+	if (mn_pkt)
 	{
-		// handle the zombie mn_pkt pointer
-		if (pktl->pkt.pts < first_pkt->pkt.pts || pktl->pkt.pts > last_pkt->pkt.pts)
-		{
-			mn_pkt = first_pkt;
-			return 0;
-		}
-
-		mn_pkt = pktl->next;
-		*pkt = pktl->pkt;
-
-		// revise the circular buffer by kicking out those overflowed packets
-		while (last_pkt->pkt.pts - first_pkt->pkt.pts > m_MaxPTSSpan)
-		{
-			// revise till reaching mn_pkt
-			if (first_pkt == pktl)
-				break;
-
-			av_packet_unref(&first_pkt->pkt); // unref the first packet
-			if (first_pkt == bg_pkt)
-			{
-				first_pkt = first_pkt->next; // move the pointer of the first packet
-				bg_pkt = first_pkt; // reset the background reading pointer
-			}
-			else
-				first_pkt = first_pkt->next; // move the pointer of the first packet
-			m_TotalPkts--; // reduce the number of total packets
-		}
-
-		return m_TotalPkts; // return the number of total packets
+		//*pkt = bg_pkt->pkt;  // this will make the pkt expose to outside
+		av_packet_ref(pkt, &mn_pkt->pkt); // expose to the outside a copy of the packet
+		mn_pkt = mn_pkt->next;
+		ret = m_TotalPkts; // return the number of total packets
 	}
 
-	pkt = NULL; // no available packet
-	return 0; // no available packet
+	flag_reading = false;
+	return ret;
 };
 
-// reset the main read
-void CircularBuffer::reset_mn_read()
+// reset the main event reading pointer to s seconds from the last packet
+void CircularBuffer::reset_mn_read(int s)
 {
-	// reset the main packet to the first packet. This method is called when starting a new main event video recording.
 	mn_pkt = first_pkt;
+	
+	// assign the main record pointer to the first packet in case s is too big
+	if (s >= m_time_span)
+	{
+		return;
+	}
+
+	// assign the main record pointer to the last packet in case s is too small
+	if (s <= 0)
+	{
+		mn_pkt = last_pkt;
+		return;
+	}
+
+	int64_t allowed_pts_video = 0;
+	int64_t allowed_pts_audio = 0;
+
+	// calculate audio pts limit in case there exists audio stream
+	if (m_index_audio >= 0)
+	{
+		allowed_pts_audio = s * m_ifmt_Ctx->streams[m_index_audio]->time_base.den / m_ifmt_Ctx->streams[m_index_audio]->time_base.num;
+	}
+
+	// calculate video pts limit in case there exists video stream
+	if (m_index_video >= 0)
+	{
+		allowed_pts_video = s * m_ifmt_Ctx->streams[m_index_video]->time_base.den / m_ifmt_Ctx->streams[m_index_video]->time_base.num;
+	}
+
+	// set the pts limits if the last packet is audio
+	if (last_pkt->pkt.stream_index == m_index_audio)
+	{
+		allowed_pts_audio = last_pkt->pkt.pts - allowed_pts_audio;  // set the pts limit of audio packets. No timebase adjustment is needed
+
+		// set the pts limit of video packets. timebase conversion is needed
+		if (m_index_video >= 0)
+		{
+			allowed_pts_video = av_rescale_q(allowed_pts_audio, m_ifmt_Ctx->streams[m_index_audio]->time_base, m_ifmt_Ctx->streams[m_index_video]->time_base);
+		}
+	}
+
+	// set the pts limits if the last packet is video
+	if (last_pkt->pkt.stream_index == m_index_video)
+	{
+		allowed_pts_video = last_pkt->pkt.pts - allowed_pts_video;  // set the pts limit of video packets. No timebase adjustment is needed
+
+		// set the pts limit of audio packets. timebase conversion is needed
+		if (m_index_audio >= 0)
+		{
+			allowed_pts_audio = av_rescale_q(allowed_pts_video, m_ifmt_Ctx->streams[m_index_video]->time_base, m_ifmt_Ctx->streams[m_index_audio]->time_base);
+		}
+	}
+
+	while ((mn_pkt->pkt.stream_index == m_index_audio && mn_pkt->pkt.pts < allowed_pts_audio)
+		|| (first_pkt->pkt.stream_index == m_index_video && first_pkt->pkt.pts < allowed_pts_video))
+	{
+		mn_pkt = mn_pkt->next;
+	}
+	return;
 };
+
+// get the input format context in circular buffer
+AVFormatContext* CircularBuffer::get_input_format_context()
+{
+	return m_ifmt_Ctx;
+};
+
+
+VideoRecorder::VideoRecorder()
+{
+	m_url = "";
+	m_ofmt_Ctx = NULL;
+	m_options = NULL;
+}
+
+VideoRecorder::~VideoRecorder()
+{
+	avformat_free_context(m_ofmt_Ctx);
+	av_dict_free(&m_options);
+}
+
+int VideoRecorder::set_options(std::string option, std::string value)
+{
+	return av_dict_set(&m_options, option.c_str(), value.c_str(), 0);
+}
+
+int VideoRecorder::init(AVCodecParameters* instream_codecpar)
+{
+	// Create a new format context for the output container format.
+	int ret = avformat_alloc_output_context2(&m_ofmt_Ctx, NULL, "mp4", NULL);
+	if (ret < 0)
+	{
+		fprintf(stderr, "Could not allocate output format context\n");
+		return ret;
+	}
+
+	AVStream* out_stream = avformat_new_stream(m_ofmt_Ctx, NULL);
+	if (!out_stream)
+	{
+		fprintf(stderr, "Failed allocating output stream\n");
+		return AVERROR_UNKNOWN;
+	}
+
+	ret = avcodec_parameters_copy(out_stream->codecpar, instream_codecpar);
+	if (ret < 0)
+	{
+		fprintf(stderr, "Failed allocating output stream.\n");
+		return ret;
+	}
+
+	out_stream->id = m_ofmt_Ctx->nb_streams - 1;
+	out_stream->codecpar->codec_tag = 0;
+	out_stream->time_base.num = 1;
+	out_stream->time_base.den = 1000; // wall clock time base is 1/1000
+	out_stream->avg_frame_rate.num = 30;
+	out_stream->avg_frame_rate.den = 1;
+	out_stream->r_frame_rate.num = 30;
+	out_stream->r_frame_rate.den = 1;
+	out_stream->pts_wrap_bits = 64;
+}
+
+int VideoRecorder::open(std::string url)
+{
+	m_url = url;
+	AVDictionary* dictionary = NULL;
+	//av_dict_set(&dictionary, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+	av_dict_set(&dictionary, "movflags", "frag_keyframe", 0);
+
+	int ret = 0;
+
+	if (!(m_ofmt_Ctx->oformat->flags & AVFMT_NOFILE))
+	{
+		ret = avio_open(&m_ofmt_Ctx->pb, m_url.c_str(), AVIO_FLAG_WRITE);
+		if (ret < 0)
+		{
+			fprintf(stderr, "Could not open output file %sn", m_url.c_str());
+			return ret;
+		}
+	}
+	else
+	{
+		fprintf(stderr, "There is a file associate to the context already.\n");
+		return ret;
+	}
+
+	ret = avformat_write_header(m_ofmt_Ctx, &dictionary);
+	if (ret < 0)
+		fprintf(stderr, "Could not open %s\n", url.c_str());
+	return ret;
+}
+
+int VideoRecorder::record(AVPacket* pkt)
+{
+	return av_interleaved_write_frame(m_ofmt_Ctx, pkt);
+}
+
+int VideoRecorder::close()
+{
+	int ret = av_write_trailer(m_ofmt_Ctx);
+
+	if (ret < 0)
+	{
+		fprintf(stderr, "Cannot write the tailer to the file.\n");
+		return ret;
+	}
+
+	if (!m_ofmt_Ctx->oformat->flags & AVFMT_NOFILE)
+		avio_closep(&m_ofmt_Ctx->pb);
+
+	return ret;
+}
