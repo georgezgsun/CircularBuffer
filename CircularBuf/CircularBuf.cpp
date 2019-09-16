@@ -6,8 +6,7 @@
 #include <Windows.h>
 //#include <pthread.h>
 
-#define CHANGE_STREAM_INDEX 0
-#define KEEP_STREAM_INDEX 1
+#define ALIGN_TO_WALL_CLOCK 1
 
 // A demo instance of Camera module using circular buffer
 // 1. Test the circular buffer 
@@ -32,7 +31,8 @@ public:
 	~CircularBuffer();
 
 	// Add the stream into the circular buffer
-	int add_stream(AVFormatContext* ifmt_Ctx, int stream_index = 0);
+	//int add_stream(AVFormatContext* ifmt_Ctx, int stream_index = 0);
+	int add_stream(AVStream * stream, int stream_index = 0);
 
 	// set the operation option
 	// option = CHANGE_STREAM_INDEX, change the stream index of every packet to 0
@@ -46,27 +46,39 @@ public:
 	int push_packet(AVPacket* pkt);
 
 	// read a packet out of the circular buffer.
-	// read using the default internal reader when pktl is null
-	// read using pktl when it is not null
-	// positive return indicates a successful read. The number returned is the current total packets in the circular buffer.
-	// 0 return indicates no available packet is read. 
-	int peek_packet(AVPacket* pkt, AVPacketList* pktl = nullptr);
+	// read a packet using the background reader when isBackground is true
+	// read a packet using the main reader when isBackground is false
+	// a positive return indicates the packet is read. 
+	int peek_packet(AVPacket* pkt, bool isBackground=true);
 
-	// get the input format context
-	AVFormatContext* get_input_format_context();
+	// reset the main reader to very beginning
+	void reset_main_reader();
+
+	// get the stream codec parameter
+	AVCodecParameters* get_stream_codecpar();
+
+	// get the stream time base
+	AVRational get_time_base();
+
+	// get the circular buffer size
+	int get_size();
 
 protected:
 	AVPacketList* first_pkt; // pointer to the first added packet in the circular buffer
 	AVPacketList* last_pkt; // pointer to the new added packet in the circular buffer
 	AVPacketList* bg_pkt; // the background reading pointer
-	AVFormatContext* m_ifmt_Ctx; // The camera input format context
+	AVPacketList* mn_pkt; // the main reading pointer
+	AVCodecParameters* m_codecpar; // The codec parameters of the bind stream
 
 	int m_TotalPkts; // counter of total packets in the circular buffer
 	int m_size;  // total size of the packets in the buffer
 	int m_time_span;  // max time span in seconds
 	int64_t m_pts_span; // pts span
-	int m_MaxSize;
-	int m_option;
+	int64_t m_wclk_offset; // the pts offset to the wall clock
+	AVRational m_time_base; // the time base of the bind stream
+	int m_stream_index; // the desired stream index
+	int m_MaxSize; // the maximum size allowed for the circular buffer 
+	int m_option; // operation options
 
 	bool flag_writing; // flag indicates adding new packet to the circular buffer
 	bool flag_reading; // flag indicates reading from the circular buffer
@@ -77,6 +89,7 @@ CircularBuffer* cbuf; // global shared the circular buffer
 AVFormatContext* ifmt_Ctx = NULL;  // global shared input format context
 int64_t lastReadPacktTime = 0; // global shared time stamp for call back
 std::string prefix_videofile = "C:\\Users\\georges\\Documents\\CopTraxTemp\\";
+bool Debug = true;
 
 class VideoRecorder
 {
@@ -85,7 +98,9 @@ public:
 	~VideoRecorder();
 
 	// intialize the recorder according to input format context
-	int add_stream(AVFormatContext* ifmt_Ctx, int stream_index=0);
+	//int add_stream(AVFormatContext* ifmt_Ctx, int stream_index=0);
+	//int add_stream(AVStream* stream, int stream_index = 0);
+	int add_stream(AVStream* stream);
 
 	// open a video recorder specified by url, can be a filename or a rtp url
 	int open(std::string url);  
@@ -104,7 +119,7 @@ public:
 
 protected:
 	std::string m_url;
-	AVFormatContext* m_ifmt_Ctx;
+	//AVFormatContext* m_ifmt_Ctx;
 	AVFormatContext* m_ofmt_Ctx;
 	AVDictionary* m_options;
 	int m_index_video;
@@ -149,6 +164,10 @@ DWORD WINAPI videoCapture(LPVOID myPtr)
 		exit(1);
 	}
 
+	// get the stream time base
+	AVRational tb = ifmt_Ctx->streams[index_video]->time_base;
+	tb.num *= 1000; // change the time base to be ms based
+
 	// read packets from IP camera and save it into circular buffer
 	while (true)
 	{
@@ -161,28 +180,32 @@ DWORD WINAPI videoCapture(LPVOID myPtr)
 			continue;
 		}
 
-		// save those video stream only
-		if (pkt.pts == AV_NOPTS_VALUE || pkt.stream_index != index_video)
-		{
-			av_packet_unref(&pkt);
-			continue;
-		}
-
-		// try to adjust the pts and dts to let them represent the wall clock time
-		if (pts_offset == 0)
-		{
-			pts_offset = av_gettime() / ifmt_Ctx->streams[index_video]->time_base.den * ifmt_Ctx->streams[index_video]->time_base.num / 1000000 - pkt.pts;
-		}
-
-		pkt.pts += pts_offset;
-		pkt.dts += pts_offset;
-
 		ret = cbuf->push_packet(&pkt);  // add the packet to the circular buffer
 		if (ret > 0)
-			fprintf(stderr, "Add a new packet (%lldms, %d) into the circular buffer of %d packets now.\n", 
-				1000 * pkt.pts * ifmt_Ctx->streams[index_video]->time_base.num / ifmt_Ctx->streams[index_video]->time_base.den, pkt.size, ret);
+		{
+			fprintf(stderr, "Add a new packet (%lldms, %d) into the circular buffer of %d packets now.\n",
+				pkt.pts * tb.num / tb.den, pkt.size, ret);
+		}
 		else
-			fprintf(stderr, "Circular buffer is now full.\n");
+		{
+			ret = 0;
+			if (ret == -1)
+			{
+				fprintf(stderr,	"A null packet is not allowed in this circular buffer.\n");
+			}
+			else if (ret == -2)
+			{
+				fprintf(stderr, "A packet with different stream index is not allowed in this circular buffer.\n");
+			}
+			else if (ret == -3)
+			{
+				fprintf(stderr, "A packet that cannot be referenced is not allowed.\n");
+			}
+			else if (ret == -4)
+			{
+				fprintf(stderr, "A packet that has no pts is not allowed.\n");
+			}
+		}
 		av_packet_unref(&pkt); // handle the release of the packet here
 	}
 }
@@ -203,7 +226,8 @@ int main(int argc, char** argv)
 {
 	// The IP camera
 	//std::string CameraPath = "rtsp://10.25.50.20/h264";
-	std::string CameraPath = "rtsp://10.0.9.113:8554/0";
+	//std::string CameraPath = "rtsp://10.0.9.113:8554/0";
+	std::string CameraPath = "rtsp://10.0.0.18/h264";
 	std::string filename_bg = ""; // file name of background recording
 	std::string filename_mn = ""; // file name of main recording
 
@@ -234,15 +258,22 @@ int main(int argc, char** argv)
 	}
 
 	// Debug only, output the camera information
-	av_dump_format(ifmt_Ctx, 0, CameraPath.c_str(), 0);
+	if (Debug)
+	{
+		av_dump_format(ifmt_Ctx, 0, CameraPath.c_str(), 0);
+	}
 
 	// Open a circular buffer
 	cbuf = new CircularBuffer(30, 100 * 1000 * 1000); // 30s and 100M
+	cbuf->add_stream(ifmt_Ctx->streams[0]);
 
 	VideoRecorder* bg_recorder = new VideoRecorder();
-	ret = bg_recorder->add_stream(ifmt_Ctx);
+	ret = bg_recorder->add_stream(ifmt_Ctx->streams[0]);
 
-	av_dump_format(bg_recorder->get_output_format_context(), 0, "sample.mp4", 1);
+	if (Debug)
+	{
+		av_dump_format(bg_recorder->get_output_format_context(), 0, "sample.mp4", 1);
+	}
 	
 	int64_t ChunkTime_bg = 0;  // Chunk time for background recording
 	int64_t ChunkTime_mn = 0;
@@ -265,6 +296,7 @@ int main(int argc, char** argv)
 	//av_dict_set(&dictionary, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
 	av_dict_set(&dictionary, "movflags", "frag_keyframe", 0);
 	AVPacket pkt;
+	AVRational timebase = cbuf->get_time_base();
 	int64_t pts0 = 0;
 
 	bg_recorder->set_options("movflags", "frag_keyframe");
@@ -285,7 +317,9 @@ int main(int argc, char** argv)
 				fprintf(stderr, "Chunked video file saved.\n");
 			}
 			else
+			{
 				fprintf(stderr, "First background recording.\n");
+			}
 
 			// Open a new chunk
 			filename_bg = prefix_videofile + std::to_string(number_bg++) + ".mp4";
@@ -300,10 +334,18 @@ int main(int argc, char** argv)
 			if (pts0 == 0)
 			{
 				pts0 = pkt.pts;
+				fprintf(stderr, "The first packet: pts=%lld, pts_time=%lld \n",
+					pts0, pts0 * timebase.num/timebase.den);
 			}
 
-			fprintf(stderr, "Read a packet (%lldms, %d), %d packets left in circular buffer.\n",
-				1000 * (pkt.pts - pts0) * ifmt_Ctx->streams[0]->time_base.num / ifmt_Ctx->streams[0]->time_base.den, pkt.size, ret);
+			fprintf(stderr, "Read a packet pts time: %lld, dt: %lldms, packet size %d, total size: %d.\n",
+				pkt.pts * timebase.num / timebase.den,
+				1000 * (pkt.pts - pts0) * timebase.num / timebase.den, pkt.size, ret);
+
+			if (pkt.pts < pts0)
+			{
+				fprintf(stderr, "error.\n");
+			}
 			if (bg_recorder->record(&pkt) < 0)
 			{
 				fprintf(stderr, "Error muxing packet in %s.\n", filename_bg.c_str());
@@ -312,9 +354,13 @@ int main(int argc, char** argv)
 		}
 		else
 		{
-			//fprintf(stderr, "No more packets for background recording.\n");
-			av_usleep(1000 * 10); // sleep for 10ms
+			if (Debug)
+			{
+				//fprintf(stderr, "No more packets for background recording.\n");
+			}
+			av_usleep(1000 * 20); // sleep for extra 20ms when there is no more background reading
 		}
+		av_usleep(1000); // sleep for 1ms
 	}
 	if (ret < 0)
 		fprintf(stderr, " with error %s.\n", av_err(ret));
@@ -330,14 +376,18 @@ CircularBuffer::CircularBuffer()
 	first_pkt = NULL;
 	last_pkt = NULL;
 	bg_pkt = (AVPacketList*)av_mallocz(sizeof(AVPacketList));
+	mn_pkt = (AVPacketList*)av_mallocz(sizeof(AVPacketList));
 
 	m_TotalPkts = 0;
 	m_size = 0;
 	m_time_span = 0;
 	m_MaxSize = 0;
-	m_option = CHANGE_STREAM_INDEX;
-	m_ifmt_Ctx = NULL;
+	m_option = ALIGN_TO_WALL_CLOCK;
+	m_wclk_offset = 0;
+	m_codecpar = avcodec_parameters_alloc(); //must be allocated with avcodec_parameters_alloc() and freed with avcodec_parameters_free().
 	m_pts_span = 0;
+	m_stream_index = 0;
+	m_time_base = AVRational{ 1, 2 };
 	
 	flag_writing = false;
 	flag_reading = false;
@@ -348,13 +398,18 @@ CircularBuffer::CircularBuffer(int time_span, int max_size)
 	first_pkt = NULL;
 	last_pkt = NULL;
 	bg_pkt = (AVPacketList*)av_mallocz(sizeof(AVPacketList));
+	mn_pkt = (AVPacketList*)av_mallocz(sizeof(AVPacketList));
 
+	m_codecpar = avcodec_parameters_alloc(); //must be allocated with avcodec_parameters_alloc() and freed with avcodec_parameters_free().
 	m_TotalPkts = 0;
 	m_size = 0;
-	m_option = CHANGE_STREAM_INDEX;
+	m_option = ALIGN_TO_WALL_CLOCK;
+	m_wclk_offset = 0;
 	m_pts_span = 0;
 	m_time_span = time_span > 0 ? time_span : 0;
 	m_MaxSize = max_size > 0 ? max_size : 0;
+	m_stream_index = 0;
+	m_time_base = AVRational{ 1, 2 };
 
 	flag_writing = false;
 	flag_reading = false;
@@ -371,24 +426,37 @@ CircularBuffer::~CircularBuffer()
 	}
 
 	av_free(bg_pkt);
+	av_free(mn_pkt);
+	avcodec_parameters_free(&m_codecpar);
 }
 
 // Add the stream into the circular buffer
-int CircularBuffer::add_stream(AVFormatContext* ifmt_ctx, int stream_index)
+//int CircularBuffer::add_stream(AVFormatContext* ifmt_ctx, int stream_index)
+int CircularBuffer::add_stream(AVStream *stream, int stream_index)
 {
 	// return 
-	if (ifmt_ctx)
+	if (!stream)
 		return -1;
 
-	m_ifmt_Ctx = ifmt_ctx;
-
-	if (stream_index >= 0 && stream_index < ifmt_ctx->nb_streams)
+	int ret = avcodec_parameters_copy(m_codecpar, stream->codecpar);
+	if (ret < 0)
 	{
-		m_pts_span = m_time_span * ifmt_ctx->streams[stream_index]->time_base.den / ifmt_ctx->streams[stream_index]->time_base.num;
+		fprintf(stderr, "Failed to copy codec parameters\n");
+		return ret;
 	}
-	else
+
+	m_time_base = stream->time_base;
+	m_stream_index = stream_index;
+	m_pts_span = m_time_span * m_time_base.den / m_time_base.num;
+	m_wclk_offset = 0; // reset the pts offset of wall clock
+
+	// clear the circular buffer in case the stream is changed
+	while (first_pkt)
 	{
-		m_pts_span = 0;
+		AVPacketList* pktl = first_pkt;
+		av_packet_unref(&pktl->pkt);
+		first_pkt = pktl->next;
+		av_free(pktl);
 	}
 
 	return 0;
@@ -406,23 +474,37 @@ void CircularBuffer::set_option(int option)
 // negative return indicates that the packet is not added due to run out of memory
 int CircularBuffer::push_packet(AVPacket* pkt)
 {
-	// Not allowed empty packet in circular buffer
+	// empty packet is not allowed in the circular buffer
 	if (!pkt)
-		return 0;
-
-	// Ensure the packet is reference counted
-	if (av_packet_make_refcounted(pkt) < 0)
 	{
-		av_packet_unref(pkt);
-		return 0;
+		return -1;
 	}
 
+	// packet with different stream index is not allowed
+	if (pkt->stream_index != m_stream_index)
+	{
+		return -2;
+	}
+
+	// packet that cannot be reference is not allowed
+	if (av_packet_make_refcounted(pkt) < 0)
+	{
+		return -3;
+	}
+
+	// packet that has no pts is not allowed
+	if (pkt->pts == AV_NOPTS_VALUE)
+	{
+		return -4;
+	}
+
+	// new a packet list, which is shall be free when getting staled
 	AVPacketList* pktl = (AVPacketList*)av_mallocz(sizeof(AVPacketList));
 	if (!pktl)
 	{
-		av_packet_unref(pkt);
+		//av_packet_unref(pkt);
 		av_free(pktl);
-		return 0;
+		return -5;
 	}
 
 	// set the writing flag to block unsafe reading
@@ -433,9 +515,31 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 	//av_packet_move_ref(&pktl->pkt, pkt);  // this makes the pkt unref
 	pktl->next = NULL;
 
-	// 
-	if (m_option & CHANGE_STREAM_INDEX)
-		pktl->pkt.stream_index = 0;
+	//	do the corresponding operations specified by the option 
+	if (m_option & ALIGN_TO_WALL_CLOCK)
+	{
+		if (m_wclk_offset == 0)
+		{
+			// calculate the pts offset against current wall clock
+			int64_t den = m_time_base.den;
+			int64_t num = 1000000L * m_time_base.num;
+			int64_t gcd = av_const av_gcd(den, num);
+			if (gcd)
+			{
+				den = den / gcd;
+				num = num / gcd;
+			}
+			if (num > den)
+				m_wclk_offset = av_gettime() * den / num - pktl->pkt.pts;
+			else
+				m_wclk_offset = av_gettime() / num * den - pktl->pkt.pts;
+			
+			//m_wclk_offset = m_wclk_offset * m_time_base.den / m_time_base.num / 1000000 - pktl->pkt.pts;
+		}
+
+		pktl->pkt.pts += m_wclk_offset;
+		pktl->pkt.dts += m_wclk_offset;
+	}
 
 	// modify the pointers
 	if (!last_pkt)
@@ -454,63 +558,75 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 		return m_TotalPkts;
 	}
 
+	// update the background reader when a new packet is added
 	if (!bg_pkt)
 		bg_pkt = last_pkt;
 
+	// update the main reader when a new packet is added
+	if (!mn_pkt)
+		mn_pkt = last_pkt;
+
 	// revise the circular buffer by kicking out those overflowed packets
 	int64_t pts_bg = bg_pkt->pkt.pts;
-	while ((first_pkt->pkt.pts < last_pkt->pkt.pts - m_pts_span) || (m_size > m_MaxSize))
+	int64_t pts_mn = mn_pkt->pkt.pts;
+	int64_t allowed_pts = last_pkt->pkt.pts - m_pts_span;
+	while ((first_pkt->pkt.pts < allowed_pts) || (m_size > m_MaxSize))
 	{
 		pktl = first_pkt;
-		m_TotalPkts--; // reduce the number of total packets
-		m_size -= first_pkt->pkt.size + sizeof(*first_pkt);
+		m_TotalPkts--; // update the number of total packets
+		m_size -= first_pkt->pkt.size + sizeof(*first_pkt);  // update the size of the circular buffer
 
 		av_packet_unref(&first_pkt->pkt); // unref the first packet
-		first_pkt = first_pkt->next;
+		first_pkt = first_pkt->next; // update the first packet list
 		av_freep(&pktl);  // free the unsed packet list
 	}
 
+	// update the background reader in case it is behind the first packet
 	if (pts_bg < first_pkt->pkt.pts)
 		bg_pkt = first_pkt;
+
+	// update the mn reader in case it is behind the first packet changed
+	if (pts_mn < first_pkt->pkt.pts)
+		mn_pkt = first_pkt;
 
 	flag_writing = false;
 	return m_TotalPkts;
 }
 
-// read a packet out of the circular buffer for background recording
-// positive return indicates a successful read. The number returned is the current total packets in the circular buffer.
-// 0 return indicates no available packet is read. Or the background reading has reached the end.
-int CircularBuffer::peek_packet(AVPacket* pkt, AVPacketList* pktl)
+// read a packet out of the circular buffer.
+// read a packet using the background reader when isBackground is true
+// read a packet using the main reader when isBackground is false
+// a positive return indicates the packet is read. 
+int CircularBuffer::peek_packet(AVPacket* pkt, bool isBackground)
 {
 	// no reading while adding new packet
 	if (flag_writing)
-		return 0;
-
-	// reading using bg_pkt when pktl is NULL
-	if (!pktl)
 	{
-		pktl = bg_pkt;
-	}
-
-	// no reading when both pktl and bg_pkt are null
-	if (!pktl)
-	{
+		pkt = NULL;
 		return 0;
 	}
 
-	// set the reading flag to stop the modify of packet list
-	flag_reading = true;
-	av_packet_ref(pkt, &pktl->pkt); // expose to the outside a copy of the packet
-	pktl = pktl->next;
-	
-	// retrieve the internal reader
-	if (bg_pkt)
+	flag_reading = true; // set the reading flag to stop the modify of packet list
+
+	if (isBackground && bg_pkt)
 	{
-		bg_pkt = pktl;
+		av_packet_ref(pkt, &bg_pkt->pkt); // expose to the outside a copy of the packet
+		bg_pkt = bg_pkt->next; // update the reader packet
+		flag_reading = false;
+		return m_size; // return the number of total packets
 	}
 
+	if (!isBackground && mn_pkt)
+	{
+		av_packet_ref(pkt, &mn_pkt->pkt); // expose to the outside a copy of the packet
+		mn_pkt = mn_pkt->next; // update the reader packet
+		flag_reading = false;
+		return m_size;
+	}
+
+	pkt = NULL;
 	flag_reading = false;
-	return m_TotalPkts; // return the number of total packets
+	return 0;
 };
 
 //// read a packet out of the circular buffer for main event recording
@@ -601,12 +717,29 @@ int CircularBuffer::peek_packet(AVPacket* pkt, AVPacketList* pktl)
 //	return;
 //};
 
-// get the input format context in circular buffer
-AVFormatContext* CircularBuffer::get_input_format_context()
+// get the time base of the circular buffer
+AVRational CircularBuffer::get_time_base()
 {
-	return m_ifmt_Ctx;
+	return m_time_base;
 };
 
+// get the size of the circular buffer
+int CircularBuffer::get_size()
+{
+	return m_size;
+};
+
+// get the codec parameters of the circular buffer
+AVCodecParameters* CircularBuffer::get_stream_codecpar()
+{
+	return m_codecpar;
+};
+
+// reset the main reader to the very beginning of the circular buffer
+void CircularBuffer::reset_main_reader()
+{
+	mn_pkt = first_pkt;
+}
 
 VideoRecorder::VideoRecorder()
 {
@@ -629,10 +762,10 @@ int VideoRecorder::set_options(std::string option, std::string value)
 	return av_dict_set(&m_options, option.c_str(), value.c_str(), 0);
 }
 
-int VideoRecorder::add_stream(AVFormatContext* ifmt_Ctx, int stream_index)
+int VideoRecorder::add_stream(AVStream* stream)
 {
 	// return an error code when no stream can be found
-	if (!ifmt_Ctx || stream_index < 0 || stream_index > ifmt_Ctx->nb_streams)
+	if (!stream)
 		return -1;
 
 	// Create a new format context for the output container format.
@@ -643,7 +776,7 @@ int VideoRecorder::add_stream(AVFormatContext* ifmt_Ctx, int stream_index)
 		return ret;
 	}
 
-	m_ifmt_Ctx = ifmt_Ctx;
+	//m_ifmt_Ctx = ifmt_Ctx;
 	AVStream* out_stream = avformat_new_stream(m_ofmt_Ctx, NULL);
 	if (!out_stream)
 	{
@@ -651,7 +784,7 @@ int VideoRecorder::add_stream(AVFormatContext* ifmt_Ctx, int stream_index)
 		return AVERROR_UNKNOWN;
 	}
 
-	ret = avcodec_parameters_copy(out_stream->codecpar, m_ifmt_Ctx->streams[stream_index]->codecpar);
+	ret = avcodec_parameters_copy(out_stream->codecpar, stream->codecpar);
 	if (ret < 0)
 	{
 		fprintf(stderr, "Failed allocating output stream.\n");
@@ -673,6 +806,16 @@ int VideoRecorder::open(std::string url)
 
 	int ret = 0;
 
+	// try to solve the 
+	for (int i = 0; i < m_ofmt_Ctx->nb_streams; i++)
+	{
+		m_ofmt_Ctx->streams[i]->start_time = AV_NOPTS_VALUE;
+		m_ofmt_Ctx->streams[i]->duration = AV_NOPTS_VALUE;
+		m_ofmt_Ctx->streams[i]->first_dts = AV_NOPTS_VALUE;
+		m_ofmt_Ctx->streams[i]->cur_dts = AV_NOPTS_VALUE;
+	}
+	m_ofmt_Ctx->output_ts_offset = 0;
+
 	if (!(m_ofmt_Ctx->oformat->flags & AVFMT_NOFILE))
 	{
 		ret = avio_open(&m_ofmt_Ctx->pb, m_url.c_str(), AVIO_FLAG_WRITE);
@@ -690,19 +833,24 @@ int VideoRecorder::open(std::string url)
 
 	ret = avformat_write_header(m_ofmt_Ctx, &dictionary);
 	if (ret < 0)
+	{
 		fprintf(stderr, "Could not open %s\n", url.c_str());
+	}
+	else
+	{
+		fprintf(stderr, "%s is openned with return code %d.\n", url.c_str(), ret);
+	}
 	return ret;
 }
 
 int VideoRecorder::record(AVPacket* pkt)
 {
+	pkt->pos = -1;
+	//pkt->dts = pkt->pts;
 	// check the interleaved flag
 	if (m_flag_interleaved)
 	{
-		//AVPacket* t_pkt;
-		//av_packet_ref(t_pkt, pkt);
-
-		return av_interleaved_write_frame(m_ofmt_Ctx, pkt);
+		return av_interleaved_write_frame(m_ofmt_Ctx, pkt); // interleaved write will handle the packet unref
 	}
 	else
 	{
@@ -716,7 +864,7 @@ int VideoRecorder::close()
 	// no close when no file is opened
 	if (m_ofmt_Ctx->oformat->flags & AVFMT_NOFILE)
 		return -1;
-		
+
 	int ret = av_write_trailer(m_ofmt_Ctx);
 	if (ret < 0)
 	{
