@@ -63,6 +63,9 @@ public:
 	// get the circular buffer size
 	int get_size();
 
+	// get the error message of last operation
+	std::string get_error_message();
+
 protected:
 	AVPacketList* first_pkt; // pointer to the first added packet in the circular buffer
 	AVPacketList* last_pkt; // pointer to the new added packet in the circular buffer
@@ -79,6 +82,9 @@ protected:
 	int m_stream_index; // the desired stream index
 	int m_MaxSize; // the maximum size allowed for the circular buffer 
 	int m_option; // operation options
+
+	int m_err; // the error code of last operation
+	std::string m_message; // the error message of last operation
 
 	bool flag_writing; // flag indicates adding new packet to the circular buffer
 	bool flag_reading; // flag indicates reading from the circular buffer
@@ -109,22 +115,41 @@ public:
 	int close();
 
 	// save the packet to the video recorder
-	int record(AVPacket* pkt); 
+	// the stream index specify the audio or video
+	int record(AVPacket* pkt, int stream_index = 0); 
 
 	// set the options for video recorder, has to be called before open
 	int set_options(std::string option, std::string value); 
 
-	// get the input format context
+	// get the output format context
 	AVFormatContext* get_output_format_context();
+
+	// get the stream time base
+	AVRational get_stream_time_base(int stream_index = 0);
+
+	// get the error message of last operation
+	std::string get_error_message();
 
 protected:
 	std::string m_url;
-	//AVFormatContext* m_ifmt_Ctx;
 	AVFormatContext* m_ofmt_Ctx;
 	AVDictionary* m_options;
 	int m_index_video;
 	int m_index_audio;
 	bool m_flag_interleaved;
+
+	AVRational m_tbf_video; // the factor to rescale the packet time stamp to fit output video stream
+	AVRational m_tbf_audio; // the factor to rescale the packet time stamp to fit output audio stream
+	AVRational m_time_base_audio;  // the time base of input audio stream
+	AVRational m_time_base_video;  // the time base of input video stream
+
+	int64_t m_pts_offset_video;
+	int64_t m_pts_offset_audio;
+	int64_t m_defalt_duration_audio;
+	int64_t m_defalt_duration_video;
+
+	int m_err; // the error code of last operation
+	std::string m_message; // the error message of last operation
 };
 
 static int interrupt_cb(void* ctx)
@@ -183,8 +208,8 @@ DWORD WINAPI videoCapture(LPVOID myPtr)
 		ret = cbuf->push_packet(&pkt);  // add the packet to the circular buffer
 		if (ret > 0)
 		{
-			fprintf(stderr, "Add a new packet (%lldms, %d) into the circular buffer of %d packets now.\n",
-				pkt.pts * tb.num / tb.den, pkt.size, ret);
+			fprintf(stderr, "Added a new packet (%lldms, %d). The circular buffer has %d packets with size %d now.\n",
+				pkt.pts * tb.num / tb.den, pkt.size, ret, cbuf->get_size());
 		}
 		else
 		{
@@ -226,8 +251,8 @@ int main(int argc, char** argv)
 {
 	// The IP camera
 	//std::string CameraPath = "rtsp://10.25.50.20/h264";
-	//std::string CameraPath = "rtsp://10.0.9.113:8554/0";
-	std::string CameraPath = "rtsp://10.0.0.18/h264";
+	std::string CameraPath = "rtsp://10.0.9.113:8554/0";
+	//std::string CameraPath = "rtsp://10.0.0.18/h264";
 	std::string filename_bg = ""; // file name of background recording
 	std::string filename_mn = ""; // file name of main recording
 
@@ -270,11 +295,6 @@ int main(int argc, char** argv)
 	VideoRecorder* bg_recorder = new VideoRecorder();
 	ret = bg_recorder->add_stream(ifmt_Ctx->streams[0]);
 
-	if (Debug)
-	{
-		av_dump_format(bg_recorder->get_output_format_context(), 0, "sample.mp4", 1);
-	}
-	
 	int64_t ChunkTime_bg = 0;  // Chunk time for background recording
 	int64_t ChunkTime_mn = 0;
 	int64_t CurrentTime;
@@ -348,17 +368,19 @@ int main(int argc, char** argv)
 			}
 			if (bg_recorder->record(&pkt) < 0)
 			{
-				fprintf(stderr, "Error muxing packet in %s.\n", filename_bg.c_str());
+				fprintf(stderr, "%s muxing packet in %s.\n", 
+					bg_recorder->get_error_message().c_str(), 
+					filename_bg.c_str());
 				break;
 			}
 		}
 		else
 		{
-			if (Debug)
-			{
-				//fprintf(stderr, "No more packets for background recording.\n");
-			}
 			av_usleep(1000 * 20); // sleep for extra 20ms when there is no more background reading
+		}
+		if (Debug)
+		{
+			fprintf(stderr, "(Debug) %s.\n", bg_recorder->get_error_message().c_str());
 		}
 		av_usleep(1000); // sleep for 1ms
 	}
@@ -375,8 +397,8 @@ CircularBuffer::CircularBuffer()
 {
 	first_pkt = NULL;
 	last_pkt = NULL;
-	bg_pkt = (AVPacketList*)av_mallocz(sizeof(AVPacketList));
-	mn_pkt = (AVPacketList*)av_mallocz(sizeof(AVPacketList));
+	bg_pkt = NULL;
+	mn_pkt = NULL;
 
 	m_TotalPkts = 0;
 	m_size = 0;
@@ -388,6 +410,9 @@ CircularBuffer::CircularBuffer()
 	m_pts_span = 0;
 	m_stream_index = 0;
 	m_time_base = AVRational{ 1, 2 };
+
+	m_err = 0;
+	m_message = "";
 	
 	flag_writing = false;
 	flag_reading = false;
@@ -397,8 +422,8 @@ CircularBuffer::CircularBuffer(int time_span, int max_size)
 {
 	first_pkt = NULL;
 	last_pkt = NULL;
-	bg_pkt = (AVPacketList*)av_mallocz(sizeof(AVPacketList));
-	mn_pkt = (AVPacketList*)av_mallocz(sizeof(AVPacketList));
+	bg_pkt = NULL;
+	mn_pkt = NULL;
 
 	m_codecpar = avcodec_parameters_alloc(); //must be allocated with avcodec_parameters_alloc() and freed with avcodec_parameters_free().
 	m_TotalPkts = 0;
@@ -410,6 +435,9 @@ CircularBuffer::CircularBuffer(int time_span, int max_size)
 	m_MaxSize = max_size > 0 ? max_size : 0;
 	m_stream_index = 0;
 	m_time_base = AVRational{ 1, 2 };
+
+	m_err = 0;
+	m_message = "";
 
 	flag_writing = false;
 	flag_reading = false;
@@ -425,8 +453,6 @@ CircularBuffer::~CircularBuffer()
 		av_free(pktl);
 	}
 
-	av_free(bg_pkt);
-	av_free(mn_pkt);
 	avcodec_parameters_free(&m_codecpar);
 }
 
@@ -434,15 +460,19 @@ CircularBuffer::~CircularBuffer()
 //int CircularBuffer::add_stream(AVFormatContext* ifmt_ctx, int stream_index)
 int CircularBuffer::add_stream(AVStream *stream, int stream_index)
 {
-	// return 
+	// check the stream
 	if (!stream)
-		return -1;
-
-	int ret = avcodec_parameters_copy(m_codecpar, stream->codecpar);
-	if (ret < 0)
 	{
-		fprintf(stderr, "Failed to copy codec parameters\n");
-		return ret;
+		m_err = -1;
+		m_message = "Empty stream is not allowed.";
+		return m_err;
+	}
+
+	m_err = avcodec_parameters_copy(m_codecpar, stream->codecpar);
+	if (m_err < 0)
+	{
+		m_message.assign(av_err(m_err));
+		return m_err;
 	}
 
 	m_time_base = stream->time_base;
@@ -459,13 +489,17 @@ int CircularBuffer::add_stream(AVStream *stream, int stream_index)
 		av_free(pktl);
 	}
 
-	return 0;
+	m_err = 0;
+	m_message = "";
+	return m_err;
 };
 
 // Set the operation option
 void CircularBuffer::set_option(int option)
 {
 	m_option = option;
+	m_err = 0;
+	m_message = "";
 }
 
 // push a video or audio packet to the circular buffer, pts and dts are adjust to wall clock
@@ -474,28 +508,39 @@ void CircularBuffer::set_option(int option)
 // negative return indicates that the packet is not added due to run out of memory
 int CircularBuffer::push_packet(AVPacket* pkt)
 {
+	m_err = 0;
+	m_message = "";
+
 	// empty packet is not allowed in the circular buffer
 	if (!pkt)
 	{
-		return -1;
+		m_err = -1;
+		m_message = "packet not accepted: empty packet";
+		return m_err;
 	}
 
-	// packet with different stream index is not allowed
+	// packet with different stream index is not accepted
 	if (pkt->stream_index != m_stream_index)
 	{
-		return -2;
+		m_err = -2;
+		m_message = "packet not accepted: stream index is different";
+		return m_err;
 	}
 
 	// packet that cannot be reference is not allowed
 	if (av_packet_make_refcounted(pkt) < 0)
 	{
-		return -3;
+		m_err = -3;
+		m_message = "packet not accepted: packet cannot be referenced";
+		return m_err;
 	}
 
 	// packet that has no pts is not allowed
 	if (pkt->pts == AV_NOPTS_VALUE)
 	{
-		return -4;
+		m_err = -4;
+		m_message = "packet not accepted: packet that has no valid pts";
+		return m_err;
 	}
 
 	// new a packet list, which is shall be free when getting staled
@@ -504,7 +549,9 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 	{
 		//av_packet_unref(pkt);
 		av_free(pktl);
-		return -5;
+		m_err = -5;
+		m_message = "cannot allocate new packet list";
+		return m_err;
 	}
 
 	// set the writing flag to block unsafe reading
@@ -522,7 +569,8 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 		{
 			// calculate the pts offset against current wall clock
 			int64_t den = m_time_base.den;
-			int64_t num = 1000000L * m_time_base.num;
+			int64_t num = m_time_base.num;
+			num *= 1000000L;
 			int64_t gcd = av_const av_gcd(den, num);
 			if (gcd)
 			{
@@ -550,11 +598,13 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 
 	m_TotalPkts++;
 	m_size += pktl->pkt.size + sizeof(*pktl);
+	m_err = 0;
 
 	// do not update the pointers while actively reading
 	if (flag_reading)
 	{
 		flag_writing = false;
+		m_message = "Warning: not modify the pointer for others are reading";
 		return m_TotalPkts;
 	}
 
@@ -590,6 +640,7 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 		mn_pkt = first_pkt;
 
 	flag_writing = false;
+	m_message = "Packet added";
 	return m_TotalPkts;
 }
 
@@ -599,11 +650,15 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 // a positive return indicates the packet is read. 
 int CircularBuffer::peek_packet(AVPacket* pkt, bool isBackground)
 {
+	m_err = 0;
+	m_message = "";
+
 	// no reading while adding new packet
 	if (flag_writing)
 	{
 		pkt = NULL;
-		return 0;
+		m_message = "Warning: not able to read while others are writting";
+		return m_err;
 	}
 
 	flag_reading = true; // set the reading flag to stop the modify of packet list
@@ -613,6 +668,7 @@ int CircularBuffer::peek_packet(AVPacket* pkt, bool isBackground)
 		av_packet_ref(pkt, &bg_pkt->pkt); // expose to the outside a copy of the packet
 		bg_pkt = bg_pkt->next; // update the reader packet
 		flag_reading = false;
+		m_message = "packet read for background recording";
 		return m_size; // return the number of total packets
 	}
 
@@ -621,11 +677,13 @@ int CircularBuffer::peek_packet(AVPacket* pkt, bool isBackground)
 		av_packet_ref(pkt, &mn_pkt->pkt); // expose to the outside a copy of the packet
 		mn_pkt = mn_pkt->next; // update the reader packet
 		flag_reading = false;
+		m_message = "packet read for main recording";
 		return m_size;
 	}
 
 	pkt = NULL;
 	flag_reading = false;
+	m_message = "no packet available to read at this moment";
 	return 0;
 };
 
@@ -720,24 +778,42 @@ int CircularBuffer::peek_packet(AVPacket* pkt, bool isBackground)
 // get the time base of the circular buffer
 AVRational CircularBuffer::get_time_base()
 {
+	m_err = 0;
+	m_message = "";
+
 	return m_time_base;
 };
 
 // get the size of the circular buffer
 int CircularBuffer::get_size()
 {
+	m_err = 0;
+	m_message = "";
+
 	return m_size;
 };
 
 // get the codec parameters of the circular buffer
 AVCodecParameters* CircularBuffer::get_stream_codecpar()
 {
+	m_err = 0;
+	m_message = "";
+
 	return m_codecpar;
 };
+
+// get the error message of last operation
+std::string CircularBuffer::get_error_message()
+{
+	return m_message;
+}
 
 // reset the main reader to the very beginning of the circular buffer
 void CircularBuffer::reset_main_reader()
 {
+	m_err = 0;
+	m_message = "";
+
 	mn_pkt = first_pkt;
 }
 
@@ -749,6 +825,16 @@ VideoRecorder::VideoRecorder()
 	m_index_video = -1;
 	m_index_audio = -1;
 	m_flag_interleaved = true;
+	m_tbf_video = AVRational{ 1,2 };
+	m_tbf_audio = AVRational{ 1,3 };
+	m_time_base_audio = AVRational{ 1,4 };
+	m_time_base_video = AVRational{ 1,5 };
+	m_pts_offset_video = 0;
+	m_pts_offset_audio = 0;
+	m_defalt_duration_audio = 0;
+	m_defalt_duration_video = 0;
+	m_err = 0;
+	m_message = "";
 }
 
 VideoRecorder::~VideoRecorder()
@@ -759,52 +845,79 @@ VideoRecorder::~VideoRecorder()
 
 int VideoRecorder::set_options(std::string option, std::string value)
 {
+	m_err = 0;
+	m_message = "";
+
 	return av_dict_set(&m_options, option.c_str(), value.c_str(), 0);
 }
 
 int VideoRecorder::add_stream(AVStream* stream)
 {
+	m_err = 0;
+	m_message = "";
+
 	// return an error code when no stream can be found
 	if (!stream)
-		return -1;
+	{
+		m_err = -1;
+		m_message = "Error. Empty stream cannot be added";
+		return m_err;
+	}
 
 	// Create a new format context for the output container format.
-	int ret = avformat_alloc_output_context2(&m_ofmt_Ctx, NULL, "mp4", NULL);
-	if (ret < 0)
+	m_err = avformat_alloc_output_context2(&m_ofmt_Ctx, NULL, "mp4", NULL);
+	if (m_err < 0)
 	{
-		fprintf(stderr, "Could not allocate output format context\n");
-		return ret;
+		//m_message = "Error. Could not allocate output format context.";
+		m_message.assign(av_err(m_err));
+		return m_err;
 	}
 
 	//m_ifmt_Ctx = ifmt_Ctx;
 	AVStream* out_stream = avformat_new_stream(m_ofmt_Ctx, NULL);
 	if (!out_stream)
 	{
-		fprintf(stderr, "Failed allocating output stream\n");
-		return AVERROR_UNKNOWN;
+		m_err = -2;
+		m_message = "Error. Failed allocating output stream.";
+		return m_err;
 	}
 
-	ret = avcodec_parameters_copy(out_stream->codecpar, stream->codecpar);
-	if (ret < 0)
+	m_err = avcodec_parameters_copy(out_stream->codecpar, stream->codecpar);
+	if (m_err < 0)
 	{
-		fprintf(stderr, "Failed allocating output stream.\n");
-		return ret;
+		m_err = -3;
+		//m_message = "Error. Failed to copy the stream codec parameters.";
+		m_message.assign(av_err(m_err));
+		return m_err;
 	}
 
 	out_stream->id = m_ofmt_Ctx->nb_streams - 1;
 	out_stream->codecpar->codec_tag = 0;
 
-	return 0;
+	if (out_stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+	{
+		m_index_video = out_stream->id;
+		m_time_base_video = stream->time_base;
+	}
+	else if (out_stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+	{
+		m_index_audio = out_stream->id;
+		m_time_base_audio = stream->time_base;
+	}
+
+	m_message = "stream is added to the recorder";
+	return m_err;
 }
 
 int VideoRecorder::open(std::string url)
 {
+	m_err = 0;
+	m_message = "";
+
 	m_url = url;
 	AVDictionary* dictionary = NULL;
 	//av_dict_set(&dictionary, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
 	av_dict_set(&dictionary, "movflags", "frag_keyframe", 0);
-
-	int ret = 0;
 
 	// try to solve the 
 	for (int i = 0; i < m_ofmt_Ctx->nb_streams; i++)
@@ -818,45 +931,127 @@ int VideoRecorder::open(std::string url)
 
 	if (!(m_ofmt_Ctx->oformat->flags & AVFMT_NOFILE))
 	{
-		ret = avio_open(&m_ofmt_Ctx->pb, m_url.c_str(), AVIO_FLAG_WRITE);
-		if (ret < 0)
+		m_err = avio_open(&m_ofmt_Ctx->pb, m_url.c_str(), AVIO_FLAG_WRITE);
+		if (m_err < 0)
 		{
-			fprintf(stderr, "Could not open output file %sn", m_url.c_str());
-			return ret;
+			//fprintf(stderr, "Could not open output file %sn", m_url.c_str());
+			m_message.assign(av_err(m_err));
+			m_message = "Could not open " + url + " with error " + m_message;
+			return m_err;
 		}
 	}
 	else
 	{
-		fprintf(stderr, "There is a file associate to the context already.\n");
-		return ret;
+		m_err = -1;
+		m_message = "Error: A file has already been associates to the context.";
+		return m_err;
 	}
 
-	ret = avformat_write_header(m_ofmt_Ctx, &dictionary);
-	if (ret < 0)
+	m_err = avformat_write_header(m_ofmt_Ctx, &dictionary);
+	if (m_err < 0)
 	{
-		fprintf(stderr, "Could not open %s\n", url.c_str());
+		m_message.assign(av_err(m_err));
+		m_message += " Could not open " + url;
+		return m_err;
 	}
-	else
+
+	m_message = url + " is openned with return code " + std::to_string(m_err);
+	m_err = 0;
+
+	// update the time base factors used to rescale the time stamps of input packets to the output stream
+	m_tbf_audio = m_time_base_audio;
+	m_tbf_video = m_time_base_video;
+	m_defalt_duration_audio = 440;
+	m_defalt_duration_video = 3000;
+	
+	if (m_index_audio >= 0)
 	{
-		fprintf(stderr, "%s is openned with return code %d.\n", url.c_str(), ret);
+		m_tbf_audio.den *= m_ofmt_Ctx->streams[m_index_audio]->time_base.num;
+		m_tbf_audio.num *= m_ofmt_Ctx->streams[m_index_audio]->time_base.den;
+		m_defalt_duration_audio = m_ofmt_Ctx->streams[m_index_audio]->time_base.den / m_ofmt_Ctx->streams[m_index_audio]->time_base.num / 44000;
 	}
-	return ret;
+
+	if (m_index_video >= 0)
+	{
+		m_tbf_video.den *= m_ofmt_Ctx->streams[m_index_video]->time_base.num;
+		m_tbf_video.num *= m_ofmt_Ctx->streams[m_index_video]->time_base.den;
+		m_defalt_duration_video = m_ofmt_Ctx->streams[m_index_video]->time_base.den / m_ofmt_Ctx->streams[m_index_video]->time_base.num / 30;
+	}
+	m_pts_offset_audio = 0;
+	m_pts_offset_video = 0;
+
+	return m_err;
 }
 
-int VideoRecorder::record(AVPacket* pkt)
+int VideoRecorder::record(AVPacket* pkt, int stream_index)
 {
+	m_err = 0;
+	m_message = "";
+
+	// rescale the time stamp to the output stream
+	if (stream_index == m_index_audio)
+	{
+		pkt->pts *= m_tbf_audio.num / m_tbf_audio.den;
+		pkt->dts *= m_tbf_audio.num / m_tbf_audio.den;
+
+		if (pkt->duration)
+		{
+			pkt->duration *= m_tbf_audio.num / m_tbf_audio.den;
+		}
+		else
+		{
+			pkt->duration = m_defalt_duration_audio;
+		}
+
+		if (m_pts_offset_audio == 0)
+		{
+			m_pts_offset_audio = -pkt->pts;
+		}
+		pkt->pts += m_pts_offset_audio;
+		pkt->dts += m_pts_offset_audio;
+	}
+	else if (stream_index == m_index_video)
+	{
+		pkt->pts *= m_tbf_video.num / m_tbf_video.den;
+		pkt->dts *= m_tbf_video.num / m_tbf_video.den;
+		if (pkt->duration)
+		{
+			pkt->duration *= m_tbf_video.num / m_tbf_video.den;
+		}
+		else
+		{
+			pkt->duration = m_defalt_duration_video;
+		}
+
+		if (m_pts_offset_audio == 0)
+		{
+			m_pts_offset_audio = -pkt->pts;
+		}
+		pkt->pts += m_pts_offset_audio;
+		pkt->dts += m_pts_offset_audio;
+	}
+
+	pkt->stream_index = stream_index;
 	pkt->pos = -1;
-	//pkt->dts = pkt->pts;
+	
 	// check the interleaved flag
 	if (m_flag_interleaved)
 	{
-		return av_interleaved_write_frame(m_ofmt_Ctx, pkt); // interleaved write will handle the packet unref
+		m_err = av_interleaved_write_frame(m_ofmt_Ctx, pkt); // interleaved write will handle the packet unref
 	}
 	else
 	{
-		av_write_frame(m_ofmt_Ctx, pkt);
+		m_err = av_write_frame(m_ofmt_Ctx, pkt);
 		av_packet_unref(pkt);
 	}
+
+	m_message = "packet written";
+	if (m_err)
+	{
+		//m_message = "Error. Cannot write the packet with error code " + std::to_string(m_err);
+		m_message.assign(av_err(m_err));
+	}
+	return m_err;
 }
 
 int VideoRecorder::close()
@@ -865,18 +1060,45 @@ int VideoRecorder::close()
 	if (m_ofmt_Ctx->oformat->flags & AVFMT_NOFILE)
 		return -1;
 
-	int ret = av_write_trailer(m_ofmt_Ctx);
-	if (ret < 0)
+	m_err = av_write_trailer(m_ofmt_Ctx);
+	if (m_err < 0)
 	{
-		fprintf(stderr, "Cannot write the tailer to the file.\n");
-		return ret;
+		m_message.assign(av_err(m_err));
+		return m_err;
 	}
 
 	avio_closep(&m_ofmt_Ctx->pb);
-	return ret;
+
+	m_message = m_url + " is closed.";
+	return m_err;
 }
 
+// get the stream codec parameter
 AVFormatContext* VideoRecorder::get_output_format_context()
 {
+	m_err = 0;
+	m_message = "";
+
 	return m_ofmt_Ctx;
+};
+
+// get the stream time base
+AVRational VideoRecorder::get_stream_time_base(int stream_index)
+{
+	m_err = 0;
+	m_message = "";
+
+	if (stream_index >= 0 && stream_index < m_ofmt_Ctx->nb_streams)
+	{
+		return m_ofmt_Ctx->streams[stream_index]->time_base;
+	}
+
+	return AVRational{ 1,1 };
+};
+
+// get the error message of last operation
+std::string VideoRecorder::get_error_message()
+{
+	return m_message;
 }
+
