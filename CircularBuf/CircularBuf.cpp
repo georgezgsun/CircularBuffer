@@ -17,14 +17,22 @@
 // 4. The main thread reads packets from circular buffer via two seperqated pointers. One is for background recording. The other one is for main event recording
 // 5. Test chunks of recordings
 
-extern "C"
+namespace FfmpegLibrary
+{
+	extern "C"
 {
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/timestamp.h>
 #include <libavutil/time.h>
+#include <libavutil/hwcontext.h>
 #include <libavdevice/avdevice.h>
+#include <libavutil/imgutils.h>
+#include <libavcodec/avcodec.h>
 }
+
+	static enum AVPixelFormat get_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts);
+	static enum AVPixelFormat m_hw_pix_fmt;
 
 class CircularBuffer
 {
@@ -34,7 +42,7 @@ public:
 
 	// Add the stream into the circular buffer
 	//int add_stream(AVFormatContext* ifmt_Ctx, int stream_index = 0);
-	void open(int time_span, int max_size, int option = ALIGN_TO_WALL_CLOCK | CHANGE_STREAM_INDEX);
+	void open(int time_span, int max_size);
 	int add_stream(AVStream * stream);
 
 	// push or add a packet to the circular buffer
@@ -79,12 +87,10 @@ protected:
 	int m_size;  // total size of the packets in the buffer
 	int m_time_span;  // max time span in seconds
 	int64_t m_pts_span; // pts span
-	int64_t m_wclk_offset; // the pts offset to the wall clock
 	int64_t m_last_pts;  // last valid pts
 	AVRational m_time_base; // the time base of the bind stream
 	int m_stream_index; // the desired stream index
 	int m_MaxSize; // the maximum size allowed for the circular buffer 
-	int m_option; // operation options
 
 	int m_err; // the error code of last operation
 	std::string m_message; // the error message of last operation
@@ -205,8 +211,6 @@ protected:
 	AVFormatContext* m_ifmt_Ctx;
 	AVDictionary* m_options;
 	int64_t m_start_time;  // hold the start time when the camera was opened
-	int64_t m_pts_offset_audio;  // hold the audio pts offset, for wall clock alignment
-	int64_t m_pts_offset_video;  // hold the video pts offset, for wall clock alignment
 	int m_index_video;
 	int m_index_audio;
 	bool m_wclk_align;
@@ -214,6 +218,34 @@ protected:
 	int m_err; // the error code of last operation
 	std::string m_message; // the error message of last operation
 	std::string m_format; // the camera format, can be rtsp, rtp, v4l2, dshow, file
+};
+
+class HWDecoder
+{
+public:
+	HWDecoder();
+	~HWDecoder();
+
+	// open the decoder by type and the codec parameter specified in the stream
+	int open(AVStream* stream, std::string device = "h264-qsv");
+
+	// send a packet to the decoder 
+	int send_packet(AVPacket* pkt);
+	
+	// get the decoded frame
+	int receive_frame(AVFrame* frame);
+
+	// get the error message of last operation
+	std::string get_error_message();
+
+protected:
+
+	AVCodecContext* m_decoder_Ctx;
+	AVCodec* m_decoder;
+	AVBufferRef* m_hw_device_Ctx;
+	
+	std::string m_message; // the error message of last operation
+	int m_err; // the error code of last operation
 };
 
 char* av_err(int ret)
@@ -239,13 +271,193 @@ const std::string get_date_time()
 	return buf;
 }
 
-// global variables
-CircularBuffer* cbuf; // global shared the circular buffer
-Camera* ipCam; // global shared IP camera
-//AVFormatContext* ifmt_Ctx = NULL;  // global shared input format context
-int64_t lastReadPacktTime = 0; // global shared time stamp for call back
-std::string prefix_videofile = "C:\\Users\\georges\\Documents\\CopTraxTemp\\";
-int Debug = 2;
+HWDecoder::HWDecoder()
+{
+	m_decoder_Ctx = NULL;
+	m_decoder = NULL;
+	m_hw_device_Ctx = NULL;
+	m_hw_pix_fmt = AV_PIX_FMT_NONE;
+
+	m_err = 0; 
+	m_message = "";
+}
+
+HWDecoder::~HWDecoder()
+{
+	avcodec_free_context(&m_decoder_Ctx);
+	av_buffer_unref(&m_hw_device_Ctx);
+}
+
+// open the decoder by type and the codec parameter specified in the stream
+int HWDecoder::open(AVStream* stream, std::string device)
+{
+	enum AVHWDeviceType type = av_hwdevice_find_type_by_name(device.c_str());
+	if (type == AV_HWDEVICE_TYPE_NONE)
+	{
+		m_err = -1;
+		m_message = "Device " + device + " unsupported";
+		return m_err;
+	}
+
+	m_err = av_hwdevice_ctx_create(&m_hw_device_Ctx, type, "auto", NULL, 0);
+	if (m_err < 0)
+	{
+		m_message = "Cannot open the hardware device";
+		return m_err;
+	}
+
+	if (stream->codecpar->codec_id == AV_CODEC_ID_H264)
+	{
+		m_decoder = avcodec_find_decoder_by_name("h264_qsv");
+	}
+	else
+	{
+		m_decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+	}
+
+	int i;
+	for (i = 0;; i++)
+	{
+		const AVCodecHWConfig* config = avcodec_get_hw_config(m_decoder, i);
+		if (!config)
+		{
+			m_err = -2;
+			m_message = "Decoder ";
+			m_message.append(m_decoder->name);
+			m_message.append(" does not support device type ");
+			m_message.append(av_hwdevice_get_type_name(type));
+			return m_err;
+		}
+
+		if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
+			config->device_type == type)
+		{
+			m_hw_pix_fmt = config->pix_fmt;
+			break;
+		}
+	}
+
+	m_decoder_Ctx = avcodec_alloc_context3(m_decoder);
+	if (!m_decoder_Ctx)
+	{
+		m_err = -1;
+		m_message = " cannot allocate memory for ";
+		m_message.append(m_decoder->long_name);
+		return m_err;
+	}
+
+	m_err = avcodec_parameters_to_context(m_decoder_Ctx, stream->codecpar);
+	if (m_err < 0)
+	{
+		m_message = "cannot assign decoder parameters";
+		return m_err;
+	}
+
+	m_decoder_Ctx->get_format = FfmpegLibrary::get_hw_format;
+
+	m_err = avcodec_open2(m_decoder_Ctx, m_decoder, NULL);
+	if (m_err < 0)
+	{
+		m_message = "failed to open codec";
+	}
+
+	return m_err;
+}
+
+static enum AVPixelFormat get_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts)
+{
+	const enum AVPixelFormat* p;
+	for (p = pix_fmts; *p != -1; p++)
+	{
+		if (*p == m_hw_pix_fmt)
+			return *p;
+	}
+
+	//HWDecoder::m_message = "failed to get HW surface format";
+	return AV_PIX_FMT_NONE;
+}
+
+// send a packet to the decoder
+// an empty packet means to flush
+// return 0 on success
+// negative return means something 
+int HWDecoder::send_packet(AVPacket* pkt)
+{
+	m_err = avcodec_send_packet(m_decoder_Ctx, pkt);
+	if (m_err < 0)
+	{
+		m_message = "error when sending packet to decoder";
+	}
+	return m_err;
+}
+
+// try to receive the decoded frame
+// return 0 when the decoder has been flushed
+// return negative when there is an error
+// return 1 when get a frame,
+int HWDecoder::receive_frame(AVFrame* frame)
+{
+	AVFrame* hw_frame = NULL;
+	uint8_t* buffer = NULL;
+
+	if (!(hw_frame = av_frame_alloc()) || !(frame = av_frame_alloc()))
+	{
+		m_err = -1;
+		m_message = "cannot allocate frame";
+	}
+
+	while (1)
+	{
+		m_err = avcodec_receive_frame(m_decoder_Ctx, hw_frame);
+		if (m_err < 0)
+		{
+			m_message = "error while decoding";
+			return m_err;
+		}
+
+		// continue until the output is available
+		if (m_err == AVERROR(EAGAIN))
+		{
+			continue;
+		}
+
+		// check if the decoder has been flushed
+		if (m_err == AVERROR_EOF)
+		{
+			av_frame_free(&hw_frame);
+			av_frame_free(&frame);
+
+			m_err = 0;
+			m_message = "decoder get fully flushed";
+			return m_err;
+		}
+
+		if (hw_frame->format == m_hw_pix_fmt)
+		{
+			// retrieve data from GPU to CPU
+			m_err = av_hwframe_transfer_data(frame, hw_frame, 0);
+			av_frame_free(&hw_frame);
+			if (m_err < 0)
+			{
+				m_message = "error transferring the data from GPU to CPU";
+				av_frame_free(&frame);
+			}
+			else
+			{
+				m_err = 1;
+			}
+			return m_err;
+		}
+	}
+
+	return m_err;
+}
+
+// get the error message of last operation
+std::string HWDecoder::get_error_message()
+{
+	return m_message;
+}
 
 Camera::Camera()
 {
@@ -261,8 +473,6 @@ Camera::Camera()
 	m_ifmt_Ctx = avformat_alloc_context();
 	m_format = "rtsp";
 	m_start_time = 0;
-	m_pts_offset_video = 0;
-	m_pts_offset_audio = 0;
 	m_wclk_align = true;
 }
 
@@ -285,13 +495,13 @@ AVFormatContext* Camera::get_input_format_context()
 	return m_ifmt_Ctx;
 }
 
-// get the stream time base
+// get the stream time base of the camera
 AVRational Camera::get_stream_time_base(int stream_index)
 {
 	m_err = 0;
 	m_message = "";
 
-	if (stream_index >= 0 && stream_index < m_ifmt_Ctx->nb_streams)
+	if (stream_index >= 0 && static_cast <unsigned int>(stream_index) < m_ifmt_Ctx->nb_streams)
 	{
 		return m_ifmt_Ctx->streams[stream_index]->time_base;
 	}
@@ -301,7 +511,10 @@ AVRational Camera::get_stream_time_base(int stream_index)
 	return AVRational{ 1,1 };
 };
 
-// Set the options that specify the open of a camera
+// Set the options used to open a camera
+// additional options are
+//  -format value, specify the camera format. dshow for a Webcam in windows, v4l2 for a Webcam in linux
+//  -wall_clock value, wall clock alignment. true to get pts in epoch, false to get original pts
 int Camera::set_options(std::string option, std::string value)
 {
 	m_err = 0;
@@ -314,7 +527,26 @@ int Camera::set_options(std::string option, std::string value)
 	}
 	else if (option == "wall_clock")
 	{
-		m_wclk_align = value == "true";
+		if (value == "false")
+		{
+			m_wclk_align = false;
+
+			m_err = 0;
+			m_message = "wall clock alignment is off";
+		}
+		else if (value == "true")
+		{
+			m_wclk_align = true;
+
+			m_err = 0;
+			m_message = "wall clock alignment is on";
+		}
+		else
+		{
+			m_message = "unkown value of '" + value + "' for 'wall clock alignment' setting";
+			m_err = -1;
+		}
+		return m_err;
 	}
 	else
 	{
@@ -371,42 +603,49 @@ int Camera::open(std::string url)
 
 	// find the index of video stream
 	AVStream* st;
-	for (int i = 0; i < m_ifmt_Ctx->nb_streams; i++)
+	for (int i = 0; static_cast <unsigned int>(i) < m_ifmt_Ctx->nb_streams; i++)
 	{
-		st = m_ifmt_Ctx->streams[i];
-		int64_t den = st->time_base.den;
-		int64_t num = st->time_base.num;
-		num *= 1000000;
-		int64_t gcd = av_const av_gcd(den, num);
-		if (gcd)
-		{
-			den = den / gcd;
-			num = num / gcd;
-		}
+		st = m_ifmt_Ctx->streams[i]; 
 
-		int64_t pts_offset;
-		if (num > den)
+		// modify the start time when required aligning to wall clock
+		if (m_wclk_align)
 		{
-			pts_offset = m_start_time * den / num - st->start_time;
-		}
-		else
-		{
-			pts_offset = m_start_time / num * den - st->start_time;
+			// calculate the correct time stamp for a very large epoch time
+			int64_t den = st->time_base.den;
+			int64_t num = st->time_base.num;
+			num *= 1000000;
+
+			int64_t gcd = av_const av_gcd(den, num);
+			if (gcd)
+			{
+				den /= gcd;
+				num /= gcd;
+			}
+
+			if (num > den)
+			{
+				st->start_time = m_start_time * den / num - st->start_time;
+			}
+			else
+			{
+				st->start_time = m_start_time / num * den - st->start_time;
+			}
 		}
 
 		if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
 		{
 			m_index_video = i;
-			m_pts_offset_video = pts_offset;
+			st->duration = st->time_base.den / st->time_base.num / 30; // default duration for video is 1/30s
 			m_message += ", video stream found";
 		}
 
 		if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
 		{
 			m_index_audio = i;
-			m_pts_offset_audio = pts_offset;
+			st->duration = st->time_base.den / st->time_base.num / 100; // default duration for audio is 1/100s
 			m_message += ", audio stream found";
 		}
+		st->duration++; // make sure it is not 0
 	}
 
 	if (m_index_video < 0 && m_index_audio < 0)
@@ -438,20 +677,21 @@ int Camera::read_packet(AVPacket* pkt)
 		return m_err;
 	}
 
-	int64_t pts_offset = pkt->stream_index == m_index_audio ? m_pts_offset_audio : m_pts_offset_video;
-
 	// Doing wall clock alignment
-	AVStream* st = m_ifmt_Ctx->streams[pkt->stream_index];
 	if (pkt->pts == AV_NOPTS_VALUE)
 	{
 		m_err = -1;
-		m_message = "pts has no value";
+		m_message = "no wall clock alignment for packet without pts value";
 		return m_err;
 	}
-	else
+
+	// make pts and pds wall clock aligned
+	AVStream* st = m_ifmt_Ctx->streams[pkt->stream_index];
+	pkt->pts += st->start_time;
+	pkt->dts += st->start_time;
+	if (!pkt->duration)
 	{
-		pkt->pts += pts_offset;
-		pkt->dts += pts_offset;
+		pkt->duration = st->duration; // assign duration to be the default duration
 	}
 
 	return m_err;
@@ -475,7 +715,7 @@ int Camera::get_audio_index()
 // index can be video index or audio index
 AVStream* Camera::get_stream(int stream_index)
 {
-	if (stream_index < 0 || stream_index >= m_ifmt_Ctx->nb_streams)
+	if (stream_index < 0 || static_cast <unsigned int>(stream_index) >= m_ifmt_Ctx->nb_streams)
 	{
 		m_err = -1;
 		m_message = "In valid stream index specified";
@@ -486,16 +726,6 @@ AVStream* Camera::get_stream(int stream_index)
 	m_message = "get the stream";
 	return m_ifmt_Ctx->streams[stream_index];
 }
-
-static int interrupt_cb(void* ctx)
-{
-	int64_t  timeout = 100 * 1000 * 1000;
-	if (av_gettime() - lastReadPacktTime > timeout)
-	{
-		return -1;
-	}
-	return 0;
-};
 
 CircularBuffer::CircularBuffer()
 {
@@ -508,8 +738,6 @@ CircularBuffer::CircularBuffer()
 	m_size = 0;
 	m_time_span = 0;
 	m_MaxSize = 0;
-	m_option = ALIGN_TO_WALL_CLOCK;
-	m_wclk_offset = 0;
 	m_codecpar = avcodec_parameters_alloc(); //must be allocated with avcodec_parameters_alloc() and freed with avcodec_parameters_free().
 	m_st = (AVStream *)av_mallocz(sizeof(AVStream));
 	m_pts_span = 0;
@@ -526,7 +754,7 @@ CircularBuffer::CircularBuffer()
 	m_codecpar = avcodec_parameters_alloc(); //must be allocated with avcodec_parameters_alloc() and freed with avcodec_parameters_free().
 }
 
-void CircularBuffer::open(int time_span, int max_size, int option)
+void CircularBuffer::open(int time_span, int max_size)
 {
 	first_pkt = NULL;
 	last_pkt = NULL;
@@ -536,8 +764,6 @@ void CircularBuffer::open(int time_span, int max_size, int option)
 	//
 	m_TotalPkts = 0;
 	m_size = 0;
-	m_option = option;
-	m_wclk_offset = 0;
 	m_pts_span = 0;
 	m_time_span = time_span > 0 ? time_span : 0;
 	m_MaxSize = max_size > 0 ? max_size : 0;
@@ -595,7 +821,6 @@ int CircularBuffer::add_stream(AVStream *stream)
 	m_time_base = stream->time_base;
 	m_stream_index = stream->index;
 	m_pts_span = m_time_span * m_time_base.den / m_time_base.num;
-	m_wclk_offset = 0; // reset the pts offset of wall clock
 
 	// clear the circular buffer in case the stream is changed
 	while (first_pkt)
@@ -632,7 +857,7 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 	if (pkt->stream_index != m_stream_index)
 	{
 		m_err = -2;
-		m_message = "packet punacceptable: stream index is different";
+		m_message = "packet unacceptable: stream index is different";
 		return m_err;
 	}
 
@@ -679,11 +904,6 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 	av_packet_ref(&pktl->pkt, pkt);  // leave the pkt alone
 	//av_packet_move_ref(&pktl->pkt, pkt);  // this makes the pkt unref
 	pktl->next = NULL;
-
-	if (m_option & CHANGE_STREAM_INDEX)
-	{
-		pktl->pkt.stream_index = 0;
-	}
 
 	// set the writing flag to block unsafe reading
 	flag_writing = true;
@@ -1075,7 +1295,7 @@ int VideoRecorder::chunk()
 
 	// try to solve the 
 	AVStream* st;
-	for (int i = 0; i < m_ofmt_Ctx->nb_streams; i++)
+	for (int i = 0; static_cast <unsigned int>(i) < m_ofmt_Ctx->nb_streams; i++)
 	{
 		st = m_ofmt_Ctx->streams[i];
 		//m_ofmt_Ctx->streams[i]->start_time = AV_NOPTS_VALUE;
@@ -1257,7 +1477,7 @@ AVRational VideoRecorder::get_stream_time_base(int stream_index)
 	m_err = 0;
 	m_message = "";
 
-	if (stream_index >= 0 && stream_index < m_ofmt_Ctx->nb_streams)
+	if (stream_index >= 0 && static_cast <unsigned int>(stream_index) < m_ofmt_Ctx->nb_streams)
 	{
 		return m_ofmt_Ctx->streams[stream_index]->time_base;
 	}
@@ -1276,17 +1496,28 @@ std::string VideoRecorder::get_url()
 {
 	return m_url;
 }
+}
+
+
+// global variables
+FfmpegLibrary::CircularBuffer* cbuf; // global shared the circular buffer
+FfmpegLibrary::Camera* ipCam; // global shared IP camera
+//AVFormatContext* ifmt_Ctx = NULL;  // global shared input format context
+int64_t lastReadPacktTime = 0; // global shared time stamp for call back
+std::string prefix_videofile = "C:\\Users\\georges\\Documents\\CopTraxTemp\\";
+int Debug = 2;
 
 // This is the sub thread that captures the video streams from specified IP camera and saves them into the circular buffer
 // void* videoCapture(void* myptr)
 DWORD WINAPI videoCapture(LPVOID myPtr)
 {
-	AVPacket pkt;
+	FfmpegLibrary::AVPacket pkt;
 
 	int ret;
 
-	AVRational tb = ipCam->get_stream_time_base();
+	FfmpegLibrary::AVRational tb = ipCam->get_stream_time_base();
 	tb.num *= 1000; // change the time base to be ms based
+	int index_video = ipCam->get_video_index();
 
 	// read packets from IP camera and save it into circular buffer
 	while (true)
@@ -1297,22 +1528,25 @@ DWORD WINAPI videoCapture(LPVOID myPtr)
 		// handle the timeout, blue screen shall be added here
 		if (ret < 0)
 		{
-			fprintf(stderr, "%s.\n", ipCam->get_error_message().c_str());
+			fprintf(stderr, "%s, error code=%d.\n", ipCam->get_error_message().c_str(), ret);
 			continue;
 		}
 
-		ret = cbuf->push_packet(&pkt);  // add the packet to the circular buffer
-		if (ret > 0)
+		if (pkt.stream_index == index_video)
 		{
-			if (Debug > 2)
+			ret = cbuf->push_packet(&pkt);  // add the packet to the circular buffer
+			if (ret > 0)
 			{
-				fprintf(stderr, "Added a new packet (%lldms, %d). The circular buffer has %d packets with size %d now.\n",
-					pkt.pts * tb.num / tb.den, pkt.size, ret, cbuf->get_size());
+				if (Debug > 2)
+				{
+					fprintf(stderr, "Added a new packet (%lldms, %d). The circular buffer has %d packets with size %d now.\n",
+						pkt.pts * tb.num / tb.den, pkt.size, ret, cbuf->get_size());
+				}
 			}
-		}
-		else
-		{
-			fprintf(stderr, "Error %s while push new packet into the circular buffer.\n", cbuf->get_error_message().c_str());
+			else
+			{
+				fprintf(stderr, "Error %s while push new packet into the circular buffer.\n", cbuf->get_error_message().c_str());
+			}
 		}
 		av_packet_unref(&pkt); // handle the release of the packet here
 	}
@@ -1321,10 +1555,12 @@ DWORD WINAPI videoCapture(LPVOID myPtr)
 int main(int argc, char** argv)
 {
 	// The IP camera
-	//std::string CameraPath = "rtsp://10.25.50.20/h264";
 	std::string CameraPath = "rtsp://10.0.9.113:8554/0";
+	//CameraPath = "rtsp://10.25.50.20/h264";
 	//CameraPath = "video=Logitech HD Pro Webcam C920";
-	//std::string CameraPath = "rtsp://10.0.0.18/h264";
+	//CameraPath = "rtsp://10.0.0.18/h264";
+	//CameraPath = "rtsp://10.25.50.21/h264";
+	CameraPath = "rtsp://10.0.9.111:554/user=admin_password=tlJwpbo6_channel=1_stream=0";
 	std::string filename_bg = ""; // file name of background recording
 	std::string filename_mn = ""; // file name of main recording
 
@@ -1333,7 +1569,7 @@ int main(int argc, char** argv)
 
 	fprintf(stderr, "Now starting the test...\n");
 
-	ipCam = new Camera();
+	ipCam = new FfmpegLibrary::Camera();
 
 	// ip camera options
 	ipCam->set_options("buffer_size", "200000");
@@ -1353,10 +1589,10 @@ int main(int argc, char** argv)
 	}
 
 	//int ret = avformat_network_init();
-	AVFormatContext* ifmt_Ctx = ipCam->get_input_format_context();
+	FfmpegLibrary::AVFormatContext* ifmt_Ctx = ipCam->get_input_format_context();
 	if (!ifmt_Ctx)
 	{
-		fprintf(stderr, "Error: %s", ipCam->get_error_message());
+		fprintf(stderr, "Error: %s", ipCam->get_error_message().c_str());
 		exit(1);
 	}
 
@@ -1367,15 +1603,15 @@ int main(int argc, char** argv)
 	}
 
 	// Open a circular buffer
-	cbuf = new CircularBuffer();
+	cbuf = new FfmpegLibrary::CircularBuffer();
 	cbuf->open(30, 100 * 1000 * 1000); // 30s and 100M
 	cbuf->add_stream(ifmt_Ctx->streams[0]);
 
-	VideoRecorder* bg_recorder = new VideoRecorder();
+	FfmpegLibrary::VideoRecorder* bg_recorder = new FfmpegLibrary::VideoRecorder();
 	//ret = bg_recorder->add_stream(ifmt_Ctx->streams[0]);
 	ret = bg_recorder->add_stream(ipCam->get_stream(ipCam->get_video_index()));
 
-	VideoRecorder* mn_recorder = new VideoRecorder();
+	FfmpegLibrary::VideoRecorder* mn_recorder = new FfmpegLibrary::VideoRecorder();
 	ret = mn_recorder->add_stream(ifmt_Ctx->streams[0]);
 
 	int64_t ChunkTime_bg = 0;  // Chunk time for background recording
@@ -1394,10 +1630,10 @@ int main(int argc, char** argv)
 		fprintf(stderr, "Cannot create the timer thread.");
 		exit(1);
 	}
-	av_usleep(10 * 1000 * 1000); // sleep for a while to have the circular buffer accumulated
+	FfmpegLibrary::av_usleep(10 * 1000 * 1000); // sleep for a while to have the circular buffer accumulated
 
-	AVPacket pkt;
-	AVRational timebase = cbuf->get_time_base();
+	FfmpegLibrary::AVPacket pkt;
+	FfmpegLibrary::AVRational timebase = cbuf->get_time_base();
 	int64_t pts0 = 0;
 	bool no_data = true;
 	bool main_recorder_recording = false;
@@ -1406,7 +1642,7 @@ int main(int argc, char** argv)
 	bg_recorder->set_options("format", "mp4"); // self defined option
 
 	mn_recorder->set_options("movflags", "frag_keyframe");
-	int64_t MainStartTime = av_gettime() / 1000 + 15000;
+	int64_t MainStartTime = FfmpegLibrary::av_gettime() / 1000 + 15000;
 	ChunkTime_mn = MainStartTime - 100;
 
 	// Open a chunked recording for background recording, where chunk time is 60s
@@ -1416,7 +1652,7 @@ int main(int argc, char** argv)
 
 	while (true)
 	{
-		CurrentTime = av_gettime() / 1000;  // read current time in miliseconds
+		CurrentTime = FfmpegLibrary::av_gettime() / 1000;  // read current time in miliseconds
 		no_data = true;
 
 		// read a background packet from the queue
@@ -1459,7 +1695,7 @@ int main(int argc, char** argv)
 		{
 			if (no_data)
 			{
-				av_usleep(1000 * 20); //sleep for 20ms
+				FfmpegLibrary::av_usleep(1000 * 20); //sleep for 20ms
 			}
 			continue;
 		}
@@ -1508,16 +1744,16 @@ int main(int argc, char** argv)
 		// sleep to reduce the cpu usage
 		if (no_data)
 		{
-			av_usleep(1000 * 20); // sleep for extra 20ms when there is no more background reading
+			FfmpegLibrary::av_usleep(1000 * 20); // sleep for extra 20ms when there is no more background reading
 		}
 		else
 		{
-			av_usleep(1000 * 5); // sleep for 5ms}
+			FfmpegLibrary::av_usleep(1000 * 5); // sleep for 5ms}
 		}
 	}
 
 	if (ret < 0)
-		fprintf(stderr, " with error %s.\n", av_err(ret));
+		fprintf(stderr, " with error %s.\n", FfmpegLibrary::av_err(ret));
 
 }
 
