@@ -80,6 +80,7 @@ protected:
 	int m_time_span;  // max time span in seconds
 	int64_t m_pts_span; // pts span
 	int64_t m_wclk_offset; // the pts offset to the wall clock
+	int64_t m_last_pts;  // last valid pts
 	AVRational m_time_base; // the time base of the bind stream
 	int m_stream_index; // the desired stream index
 	int m_MaxSize; // the maximum size allowed for the circular buffer 
@@ -107,11 +108,10 @@ public:
 	// chunk > 0 indicates save to a series of chunked file in interval chunk seconds, url is used as prefix
 	int open(std::string url, int chunk = 0);
 
-	// make another chunked recording by filename url
-	// first stop current recording in case there is one. Then start another recording by name url.
-	// Full stop in case url is empty
+	// make another chunked recording
+	// first stop current recording in case there is one. Then start another recording by chunk prefix.
 	// return 0 on success
-	int chunk(std::string url);
+	int chunk();
 
 	// close the video recorder
 	int close();
@@ -132,10 +132,10 @@ public:
 	// get the error message of last operation
 	std::string get_error_message();
 
-protected:
-	// open the output
-	int re_open();
+	// get the recording filename or url
+	std::string get_url();
 
+protected:
 	std::string m_url;
 	AVFormatContext* m_ofmt_Ctx;
 	AVDictionary* m_options;
@@ -204,11 +204,16 @@ protected:
 	std::string m_url;
 	AVFormatContext* m_ifmt_Ctx;
 	AVDictionary* m_options;
+	int64_t m_start_time;  // hold the start time when the camera was opened
+	int64_t m_pts_offset_audio;  // hold the audio pts offset, for wall clock alignment
+	int64_t m_pts_offset_video;  // hold the video pts offset, for wall clock alignment
 	int m_index_video;
 	int m_index_audio;
+	bool m_wclk_align;
 
 	int m_err; // the error code of last operation
 	std::string m_message; // the error message of last operation
+	std::string m_format; // the camera format, can be rtsp, rtp, v4l2, dshow, file
 };
 
 char* av_err(int ret)
@@ -254,6 +259,11 @@ Camera::Camera()
 	m_err = avformat_network_init();
 	avdevice_register_all();
 	m_ifmt_Ctx = avformat_alloc_context();
+	m_format = "rtsp";
+	m_start_time = 0;
+	m_pts_offset_video = 0;
+	m_pts_offset_audio = 0;
+	m_wclk_align = true;
 }
 
 Camera::~Camera()
@@ -297,24 +307,35 @@ int Camera::set_options(std::string option, std::string value)
 	m_err = 0;
 	m_message = "";
 
-	return av_dict_set(&m_options, option.c_str(), value.c_str(), 0);
+	if (option == "format")
+	{
+		m_format = value;
+		m_message = "update the camera format to be " + value;
+	}
+	else if (option == "wall_clock")
+	{
+		m_wclk_align = value == "true";
+	}
+	else
+	{
+		m_err = av_dict_set(&m_options, option.c_str(), value.c_str(), 0);
+		m_message = "set the option '" + option + "' to be " + value;
+	}
+	return m_err;
 }
 
 // open/connect to the camera
 // return 0 on success
 int Camera::open(std::string url)
 {
-	if (!url.empty())
-	{
-		m_url = url;
-	}
-
-	if (m_url.empty())
+	// check if the url is empty
+	if (url.empty())
 	{
 		m_err = -1;
 		m_message = "Error. Camera path is empty";
 		return m_err;
 	}
+	m_url = url;
 
 	// to determine the camera type
 	m_message = "IP Camera: ";
@@ -322,12 +343,12 @@ int Camera::open(std::string url)
 	if (url.find("/dev/") != std::string::npos)
 	{
 		ifmt = av_find_input_format("v4l2");
-		m_message = "USB (Linux): ";
+		m_message = "v4l2: ";
 	}
-	else if (url.find("://") == std::string::npos)
+	else
 	{
-		ifmt = av_find_input_format("dshow");
-		m_message = "USB (Windows): ";
+		ifmt = av_find_input_format(m_format.c_str());
+		m_message = m_format + ": "; // "USB (Windows)";
 	}
 
 	m_err = avformat_open_input(&m_ifmt_Ctx, m_url.c_str(), ifmt, &m_options);
@@ -336,6 +357,7 @@ int Camera::open(std::string url)
 		m_message.append(av_err(m_err));
 		return m_err;
 	}
+	m_start_time = av_gettime();  // hold global start time in microseconds
 
 	m_err = avformat_find_stream_info(m_ifmt_Ctx, 0);
 	if (m_err < 0)
@@ -348,17 +370,41 @@ int Camera::open(std::string url)
 	m_message += " connected";
 
 	// find the index of video stream
+	AVStream* st;
 	for (int i = 0; i < m_ifmt_Ctx->nb_streams; i++)
 	{
-		if (m_ifmt_Ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+		st = m_ifmt_Ctx->streams[i];
+		int64_t den = st->time_base.den;
+		int64_t num = st->time_base.num;
+		num *= 1000000;
+		int64_t gcd = av_const av_gcd(den, num);
+		if (gcd)
+		{
+			den = den / gcd;
+			num = num / gcd;
+		}
+
+		int64_t pts_offset;
+		if (num > den)
+		{
+			pts_offset = m_start_time * den / num - st->start_time;
+		}
+		else
+		{
+			pts_offset = m_start_time / num * den - st->start_time;
+		}
+
+		if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
 		{
 			m_index_video = i;
+			m_pts_offset_video = pts_offset;
 			m_message += ", video stream found";
 		}
 
-		if (m_ifmt_Ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+		if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
 		{
 			m_index_audio = i;
+			m_pts_offset_audio = pts_offset;
 			m_message += ", audio stream found";
 		}
 	}
@@ -384,6 +430,28 @@ int Camera::read_packet(AVPacket* pkt)
 		m_message.assign(av_err(m_err));
 		m_message = "Time out while reading " + m_url + " with error " + m_message;
 		pkt = NULL;
+		return m_err;
+	}
+
+	if (!m_wclk_align)
+	{
+		return m_err;
+	}
+
+	int64_t pts_offset = pkt->stream_index == m_index_audio ? m_pts_offset_audio : m_pts_offset_video;
+
+	// Doing wall clock alignment
+	AVStream* st = m_ifmt_Ctx->streams[pkt->stream_index];
+	if (pkt->pts == AV_NOPTS_VALUE)
+	{
+		m_err = -1;
+		m_message = "pts has no value";
+		return m_err;
+	}
+	else
+	{
+		pkt->pts += pts_offset;
+		pkt->dts += pts_offset;
 	}
 
 	return m_err;
@@ -450,6 +518,7 @@ CircularBuffer::CircularBuffer()
 
 	m_err = 0;
 	m_message = "";
+	m_last_pts = 0;
 	
 	flag_writing = false;
 	flag_reading = false;
@@ -555,7 +624,7 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 	if (!pkt)
 	{
 		m_err = -1;
-		m_message = "packet not accepted: empty packet";
+		m_message = "packet unacceptable: empty";
 		return m_err;
 	}
 
@@ -563,7 +632,7 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 	if (pkt->stream_index != m_stream_index)
 	{
 		m_err = -2;
-		m_message = "packet not accepted: stream index is different";
+		m_message = "packet punacceptable: stream index is different";
 		return m_err;
 	}
 
@@ -571,7 +640,7 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 	if (av_packet_make_refcounted(pkt) < 0)
 	{
 		m_err = -3;
-		m_message = "packet not accepted: packet cannot be referenced";
+		m_message = "packet unacceptable: cannot be referenced";
 		return m_err;
 	}
 
@@ -579,11 +648,11 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 	if (pkt->pts == AV_NOPTS_VALUE)
 	{
 		m_err = -4;
-		m_message = "packet not accepted: packet that has no valid pts";
+		m_message = "packet unacceptable: has no valid pts";
 		return m_err;
 	}
 
-	// new a packet list, which is shall be free when getting staled
+	// new a packet list, which is going to be freed when getting staled later
 	AVPacketList* pktl = (AVPacketList*)av_mallocz(sizeof(AVPacketList));
 	if (!pktl)
 	{
@@ -594,50 +663,30 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 		return m_err;
 	}
 
-	// set the writing flag to block unsafe reading
-	flag_writing = true;
+	// packet that is non monotonically increasing
+	if (m_last_pts == 0)
+	{
+		m_last_pts = pkt->pts;
+	}
+
+	if (pkt->pts < m_last_pts)
+	{
+		m_err = -6;
+		m_message = "packet unacceptable: non monotonically increasing";
+	}
 
 	// add the packet to the queue
 	av_packet_ref(&pktl->pkt, pkt);  // leave the pkt alone
 	//av_packet_move_ref(&pktl->pkt, pkt);  // this makes the pkt unref
 	pktl->next = NULL;
 
-	//	do the corresponding operations specified by the option 
-	if (m_option & ALIGN_TO_WALL_CLOCK)
-	{
-		if (m_wclk_offset == 0)
-		{
-			// calculate the pts offset against current wall clock
-			int64_t den = m_time_base.den;
-			int64_t num = m_time_base.num;
-			num *= 1000000L;
-			int64_t gcd = av_const av_gcd(den, num);
-			if (gcd)
-			{
-				den = den / gcd;
-				num = num / gcd;
-			}
-			if (num > den)
-			{
-				m_wclk_offset = av_gettime() * den / num - pktl->pkt.pts;
-			}
-			else
-			{
-				m_wclk_offset = av_gettime() / num * den - pktl->pkt.pts;
-			}
-			
-			m_st->start_time = m_wclk_offset;
-			//m_wclk_offset = m_wclk_offset * m_time_base.den / m_time_base.num / 1000000 - pktl->pkt.pts;
-		}
-
-		pktl->pkt.pts += m_wclk_offset;
-		pktl->pkt.dts += m_wclk_offset;
-	}
-
 	if (m_option & CHANGE_STREAM_INDEX)
 	{
 		pktl->pkt.stream_index = 0;
 	}
+
+	// set the writing flag to block unsafe reading
+	flag_writing = true;
 
 	// modify the pointers
 	if (!last_pkt)
@@ -653,18 +702,22 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 	// do not update the pointers while actively reading
 	if (flag_reading)
 	{
-		flag_writing = false;
+		flag_writing = false; // clear the writing flag
 		m_message = "Warning: not modify the pointer for others are reading";
 		return m_TotalPkts;
 	}
 
 	// update the background reader when a new packet is added
 	if (!bg_pkt)
+	{
 		bg_pkt = last_pkt;
+	}
 
 	// update the main reader when a new packet is added
 	if (!mn_pkt)
+	{
 		mn_pkt = last_pkt;
+	}
 
 	// maintain the circular buffer by kicking out those overflowed packets
 	int64_t pts_bg = bg_pkt->pkt.pts;
@@ -683,13 +736,17 @@ int CircularBuffer::push_packet(AVPacket* pkt)
 
 	// update the background reader in case it is behind the first packet
 	if (pts_bg < first_pkt->pkt.pts)
+	{
 		bg_pkt = first_pkt;
+	}
 
 	// update the mn reader in case it is behind the first packet changed
 	if (pts_mn < first_pkt->pkt.pts)
+	{
 		mn_pkt = first_pkt;
+	}
 
-	flag_writing = false;
+	flag_writing = false; // clear the writting flag
 	m_message = "Packet added";
 	return m_TotalPkts;
 }
@@ -983,11 +1040,22 @@ int VideoRecorder::open(std::string url, int chunk_interval)
 	}
 
 	m_chunk_time = 0;
-	return re_open();
+	return chunk();
 }
 
-int VideoRecorder::re_open()
+// make another chunked recording
+// first stop current recording in case there is one. Then start another recording by chunk prefix.
+// return 0 on success
+int VideoRecorder::chunk()
 {
+	// to check the chunk setting
+	if (m_chunk_prefix.empty() || !m_chunk_interval)
+	{
+		m_err = -1;
+		m_message = "Invalid chunk settings.";
+		return m_err;
+	}
+
 	// uses m_chunk_time as an indicateor of first recording
 	if (m_chunk_time)
 	{
@@ -999,15 +1067,11 @@ int VideoRecorder::re_open()
 		}
 	}
 
-	m_chunk_time = 0;
-	if (m_chunk_interval)
-	{
-		// set next chunk time, at x:xx:00 if wall clock alignment is set
-		m_chunk_time = m_flag_wclk ? (av_gettime() / 1000 / m_chunk_interval + 1) * m_chunk_interval : av_gettime() / 1000 + m_chunk_interval; 
+	// set next chunk time, at x:xx:00 if wall clock alignment is set
+	m_chunk_time = m_flag_wclk ? (av_gettime() / 1000 / m_chunk_interval + 1) * m_chunk_interval : av_gettime() / 1000 + m_chunk_interval; 
 		
-		// file name is set as <prefix><yyyy-MM-dd-hhmmss>.<ext>
-		m_url = m_chunk_prefix + get_date_time() + "." + m_format;
-	}
+	// file name is set as <prefix><yyyy-MM-dd-hhmmss>.<ext>
+	m_url = m_chunk_prefix + get_date_time() + "." + m_format;
 
 	// try to solve the 
 	AVStream* st;
@@ -1019,7 +1083,7 @@ int VideoRecorder::re_open()
 		//m_ofmt_Ctx->streams[i]->first_dts = AV_NOPTS_VALUE;
 		//m_ofmt_Ctx->streams[i]->cur_dts = AV_NOPTS_VALUE;
 		st->start_time = AV_NOPTS_VALUE;
-		st->duration = m_chunk_interval * 90;
+		st->duration = static_cast<int64_t>(m_chunk_interval) * 90;
 		st->first_dts = AV_NOPTS_VALUE;
 		st->cur_dts = 0;
 	}
@@ -1077,30 +1141,6 @@ int VideoRecorder::re_open()
 	m_pts_offset_video = 0;
 
 	return m_err;
-}
-
-// make another chunked recording by filename url
-// first stop current recording in case there is one. Then start another recording by name url.
-// Full stop in case url is empty
-// return 0 on success
-int VideoRecorder::chunk(std::string url)
-{
-	// update the chunk prefix
-	m_chunk_prefix = url;
-
-	// stop recording in case url is empty
-	if (url.empty())
-	{
-		m_chunk_time = 0;
-		m_chunk_interval = 0;
-		return close();
-	}
-
-	m_chunk_time = 1;
-	// m_chunk_interval = 3600000L; // for chunk = 3600s
-	m_chunk_interval = 60000; // 60s
-	m_flag_wclk = false;
-	return re_open();
 }
 
 int VideoRecorder::record(AVPacket* pkt, int stream_index)
@@ -1162,8 +1202,8 @@ int VideoRecorder::record(AVPacket* pkt, int stream_index)
 	else
 	{
 		m_err = av_write_frame(m_ofmt_Ctx, pkt);
-		av_packet_unref(pkt);
 	}
+	av_packet_unref(pkt);
 
 	m_message = "packet written";
 	if (m_err)
@@ -1176,7 +1216,7 @@ int VideoRecorder::record(AVPacket* pkt, int stream_index)
 	int64_t t = av_gettime() / 1000;
 	if (m_chunk_time && t >= m_chunk_time)
 	{
-		m_err = re_open();
+		m_err = chunk();
 	}
 	//m_err = m_chunk_time && av_gettime() / 1000 >= m_chunk_time ? re_open() : 0;
 
@@ -1231,6 +1271,12 @@ std::string VideoRecorder::get_error_message()
 	return m_message;
 }
 
+// get the recording filename or url
+std::string VideoRecorder::get_url()
+{
+	return m_url;
+}
+
 // This is the sub thread that captures the video streams from specified IP camera and saves them into the circular buffer
 // void* videoCapture(void* myptr)
 DWORD WINAPI videoCapture(LPVOID myPtr)
@@ -1276,7 +1322,7 @@ int main(int argc, char** argv)
 {
 	// The IP camera
 	//std::string CameraPath = "rtsp://10.25.50.20/h264";
-	std::string CameraPath = "rtsp://10.0.9.117:8554/0";
+	std::string CameraPath = "rtsp://10.0.9.113:8554/0";
 	//CameraPath = "video=Logitech HD Pro Webcam C920";
 	//std::string CameraPath = "rtsp://10.0.0.18/h264";
 	std::string filename_bg = ""; // file name of background recording
@@ -1284,6 +1330,8 @@ int main(int argc, char** argv)
 
 	if (argc > 1)
 		CameraPath.assign(argv[1]);
+
+	fprintf(stderr, "Now starting the test...\n");
 
 	ipCam = new Camera();
 
@@ -1346,7 +1394,7 @@ int main(int argc, char** argv)
 		fprintf(stderr, "Cannot create the timer thread.");
 		exit(1);
 	}
-	av_usleep(1 * 1000 * 1000); // sleep for a while to have the circular buffer accumulated
+	av_usleep(10 * 1000 * 1000); // sleep for a while to have the circular buffer accumulated
 
 	AVPacket pkt;
 	AVRational timebase = cbuf->get_time_base();
@@ -1363,6 +1411,7 @@ int main(int argc, char** argv)
 
 	// Open a chunked recording for background recording, where chunk time is 60s
 	ret = bg_recorder->open(prefix_videofile + "background-", 60);
+	filename_bg = bg_recorder->get_url();
 	av_dump_format(bg_recorder->get_output_format_context(), 0, filename_bg.c_str(), 1);
 
 	while (true)
@@ -1386,8 +1435,8 @@ int main(int argc, char** argv)
 
 			if (Debug > 2)
 			{
-				fprintf(stderr, "Read a background packet pts time: %lld, dt: %lldms, packet size %d, total size: %d.\n",
-					pkt.pts * timebase.num / timebase.den,
+				fprintf(stderr, "Read a background packet pts time: %lldms, dt: %lldms, packet size %d, total size: %d.\n",
+					1000 * pkt.pts * timebase.num / timebase.den,
 					1000 * (pkt.pts - pts0) * timebase.num / timebase.den, pkt.size, ret);
 			}
 
@@ -1405,19 +1454,21 @@ int main(int argc, char** argv)
 			no_data = false;
 		}
 
-		// arbitrary set main recording starts 20s later
+		// arbitrary set main recording starts 15s later
+		if (CurrentTime <= MainStartTime)
+		{
+			if (no_data)
+			{
+				av_usleep(1000 * 20); //sleep for 20ms
+			}
+			continue;
+		}
+
 		if (!main_recorder_recording)
 		{
-			if (CurrentTime <= MainStartTime)
-			{
-				if (no_data)
-					av_usleep(1000 * 20); //sleep for 20ms
-				continue;
-			}
-
-			filename_mn = prefix_videofile + "main-" + get_date_time() + ".mp4";
-			ret = mn_recorder->open(filename_mn);
-			av_dump_format(mn_recorder->get_output_format_context(), 0, filename_mn.c_str(), 1);
+			//filename_mn = prefix_videofile + "main-" + get_date_time() + ".mp4";
+			ret = mn_recorder->open(prefix_videofile + "main-", 3600);
+			av_dump_format(mn_recorder->get_output_format_context(), 0, mn_recorder->get_url().c_str(), 1);
 			main_recorder_recording = true;
 			ChunkTime_mn = CurrentTime + 60000;
 		}
@@ -1425,8 +1476,9 @@ int main(int argc, char** argv)
 		// simulate the external chunk signal
 		if (ChunkTime_mn && CurrentTime > ChunkTime_mn)
 		{
-			ChunkTime_mn = 0;
-			mn_recorder->chunk(prefix_videofile + "main+");
+			ChunkTime_mn += 120000;
+			mn_recorder->chunk();
+			av_dump_format(mn_recorder->get_output_format_context(), 0, mn_recorder->get_url().c_str(), 1);
 			fprintf(stderr, "Main recording get chunked.\n");
 		}
 
